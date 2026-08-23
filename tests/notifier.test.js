@@ -71,6 +71,21 @@ test('filters out notification types disabled in config', async () => {
   assert.equal(calls.sent.length, 0);
 });
 
+test('missing botToken/chatId skips polling, sends nothing, warns once, no toast', async () => {
+  const config = { ...ENABLED_CONFIG, botToken: '', chatId: '' };
+  const { notifier, calls } = buildNotifier({ loadConfig: () => config });
+
+  await notifier.tick();
+  const result = await notifier.tick();
+
+  assert.equal(result.sent, 0);
+  assert.equal(calls.listCalls, 0);
+  assert.equal(calls.sent.length, 0);
+  assert.equal(calls.toasts.length, 0);
+  assert.equal(calls.logs.length, 1);
+  assert.match(calls.logs[0], /not configured/);
+});
+
 test('master enabled=false skips polling entirely', async () => {
   const config = { ...ENABLED_CONFIG, enabled: false };
   const { notifier, calls } = buildNotifier({ loadConfig: () => config });
