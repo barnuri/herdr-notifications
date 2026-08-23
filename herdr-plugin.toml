@@ -1,0 +1,21 @@
+id = "barnuri.telegram-notifications"
+name = "Telegram Notifications"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Send a Telegram message when a herdr agent goes idle, gets blocked, or finishes"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["node", "bin/watch.js"]
+
+[[actions]]
+id = "send-test"
+title = "Send test Telegram message"
+contexts = ["workspace", "pane"]
+command = ["node", "bin/test-message.js"]
+
+[[actions]]
+id = "edit-config"
+title = "Edit Telegram notification settings"
+contexts = ["workspace", "pane"]
+command = ["node", "bin/edit-config.js"]
