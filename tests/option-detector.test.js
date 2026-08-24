@@ -58,6 +58,55 @@ test('a real Claude Code select-menu prompt (pointer glyph on the highlighted op
   ]);
 });
 
+test('wrapped multi-line option descriptions and separators do not break the run', () => {
+  // Shape captured from a real Claude Code AskUserQuestion prompt: each
+  // option's description wraps onto indented continuation lines, and a
+  // horizontal rule sits between the numbered options and the trailing
+  // built-in free-text ones.
+  const text = [
+    ' │ The dedup/state/audit atomicity bug needs a real fix.',
+    '',
+    ' ❯ 1. Scoped transaction (Recommended)',
+    '      Wrap dedup+approval-upsert+audit into one shared',
+    '      session/commit per write. Fixes the demon',
+    '      without a new architecture.',
+    '   2. Full transactional outbox',
+    '      Add an outbox table + relay: every write commits',
+    '      notification as a row in the same transaction.',
+    '   3. Type something.',
+    '',
+    '──────────────',
+    '   4. Chat about this',
+    '',
+    'Enter to select · Tab/Arrow keys to navigate · Esc to cancel',
+  ].join('\n');
+  assert.deepEqual(detectOptions(text), [
+    { label: '1. Scoped transaction (Recommended)', value: '1' },
+    { label: '2. Full transactional outbox', value: '2' },
+    { label: '3. Type something.', value: '3', expectsText: true },
+    { label: '4. Chat about this', value: '4', expectsText: true },
+  ]);
+});
+
+test('a stale answered menu earlier in scrollback does not merge with the current one', () => {
+  const text = [
+    '1. Old choice A',
+    '   wrapped description of the old choice',
+    '2. Old choice B',
+    'Selected: 1. Old choice A',
+    'Agent did some work here.',
+    '1. New choice A',
+    '   wrapped description of the new choice',
+    '2. New choice B',
+    '3. New choice C',
+  ].join('\n');
+  assert.deepEqual(detectOptions(text), [
+    { label: '1. New choice A', value: '1' },
+    { label: '2. New choice B', value: '2' },
+    { label: '3. New choice C', value: '3' },
+  ]);
+});
+
 test('y/n-style prompt variants each return the two-option Yes/No array', () => {
   const expected = [
     { label: 'Yes', value: 'y' },

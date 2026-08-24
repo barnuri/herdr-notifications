@@ -12,7 +12,7 @@ const CONFIG = Object.freeze({
 });
 
 function buildStateStore(overrides = {}) {
-  const calls = { setOffset: [], expirePane: [], trackBlocked: [] };
+  const calls = { setOffset: [], expirePane: [], trackBlocked: [], setAwaitingText: [], registerMessage: [] };
   return {
     calls,
     getOffset: () => 0,
@@ -21,6 +21,9 @@ function buildStateStore(overrides = {}) {
     resolveByMessageId: overrides.resolveByMessageId || (() => null),
     resolveOptionsByPane: overrides.resolveOptionsByPane || (() => null),
     getBlockedPanes: overrides.getBlockedPanes || (() => []),
+    isAwaitingText: overrides.isAwaitingText || (() => false),
+    setAwaitingText: (paneId) => calls.setAwaitingText.push(paneId),
+    registerMessage: (messageId, paneId) => calls.registerMessage.push({ messageId, paneId }),
     expirePane: (paneId) => calls.expirePane.push(paneId),
     trackBlocked: (paneId, args) => calls.trackBlocked.push({ paneId, args }),
   };
@@ -446,4 +449,79 @@ test('notifyBlocked HTML-escapes agent output before embedding it in the message
   assert.doesNotMatch(text, /<script>/);
   assert.match(text, /&lt;script&gt;/);
   assert.match(text, /&amp;/);
+});
+
+test('notifyBlocked marks expectsText option buttons with a pencil suffix', async () => {
+  const options = [
+    { label: '1. Yes', value: '1' },
+    { label: '2. Type something.', value: '2', expectsText: true },
+  ];
+  const { relay, calls } = buildRelay({
+    readAgentOutput: async () => '1. Yes\n2. Type something.',
+    detectOptions: () => options,
+  });
+
+  await relay.notifyBlocked({ paneId: 'p1', agent: {} }, CONFIG);
+
+  const { replyMarkup } = calls.sendMessage[0];
+  assert.equal(replyMarkup.inline_keyboard[0][0].text, '1. Yes');
+  assert.equal(replyMarkup.inline_keyboard[0][1].text, '2. Type something. ✏️');
+});
+
+test('tapping an expectsText option sends the digit, keeps the pane awaiting text, and prompts for the follow-up reply', async () => {
+  const stateStore = buildStateStore({
+    resolveByToken: (token) =>
+      (token === 'abc123'
+        ? { paneId: 'p1', options: [{ label: '3. Type something.', value: '3', expectsText: true }], text: 'body' }
+        : null),
+  });
+  const update = callbackUpdate({ updateId: 1, data: 'r:abc123:0' });
+  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
+
+  await relay.pollUpdates();
+
+  assert.deepEqual(calls.answerBlockedAgent, [{ paneId: 'p1', text: '3' }]);
+  assert.deepEqual(stateStore.calls.setAwaitingText, ['p1']);
+  assert.deepEqual(stateStore.calls.expirePane, []);
+  assert.equal(calls.sendMessage.length, 1);
+  const prompt = calls.sendMessage[0];
+  assert.match(prompt.text, /reply with the text/i);
+  assert.deepEqual(prompt.replyMarkup, { force_reply: true });
+  assert.deepEqual(stateStore.calls.registerMessage, [{ messageId: 999, paneId: 'p1' }]);
+});
+
+test('a reply to a pane awaiting text is relayed verbatim (no option matching) and expires the pane', async () => {
+  const stateStore = buildStateStore({
+    resolveByMessageId: (messageId) => (messageId === 5 ? 'p1' : null),
+    isAwaitingText: (paneId) => paneId === 'p1',
+    // A stale option whose value matches the reply — must NOT be applied.
+    resolveOptionsByPane: () => [{ label: '1. Yes', value: '1' }],
+  });
+  const update = messageUpdate({ updateId: 1, text: '1', replyToMessageId: 5 });
+  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
+
+  await relay.pollUpdates();
+
+  assert.deepEqual(calls.answerBlockedAgent, [{ paneId: 'p1', text: '1' }]);
+  assert.deepEqual(stateStore.calls.expirePane, ['p1']);
+});
+
+test('a free-text reply matching an expectsText option follows the same two-step path as a button tap', async () => {
+  const stateStore = buildStateStore({
+    getBlockedPanes: () => ['p1'],
+    resolveOptionsByPane: () => [
+      { label: '1. Yes', value: '1' },
+      { label: '4. Chat about this', value: '4', expectsText: true },
+    ],
+  });
+  const update = messageUpdate({ updateId: 1, text: 'chat about this' });
+  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
+
+  await relay.pollUpdates();
+
+  assert.deepEqual(calls.answerBlockedAgent, [{ paneId: 'p1', text: '4' }]);
+  assert.deepEqual(stateStore.calls.setAwaitingText, ['p1']);
+  assert.deepEqual(stateStore.calls.expirePane, []);
+  assert.equal(calls.sendMessage.length, 1);
+  assert.match(calls.sendMessage[0].text, /reply with the text/i);
 });

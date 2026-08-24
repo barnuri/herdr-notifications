@@ -114,6 +114,42 @@ test('resolveOptionsByPane returns the tracked options for a blocked pane, or nu
   assert.equal(store.resolveOptionsByPane('pane1'), null);
 });
 
+test('setAwaitingText keeps pane/message routing but drops the menu, and persists across restart', () => {
+  const store = new RelayStateStore();
+  store.trackBlocked('pane1', { messageId: 'm1', token: 't1', options: ['a', 'b'] });
+
+  store.setAwaitingText('pane1');
+
+  assert.equal(store.isAwaitingText('pane1'), true);
+  assert.equal(store.resolveOptionsByPane('pane1'), null);
+  assert.equal(store.resolveByToken('t1'), null);
+  assert.deepEqual(store.getBlockedPanes(), ['pane1']);
+  assert.equal(store.resolveByMessageId('m1'), 'pane1');
+
+  const restarted = new RelayStateStore();
+  assert.equal(restarted.isAwaitingText('pane1'), true);
+});
+
+test('expirePane clears the awaitingText flag', () => {
+  const store = new RelayStateStore();
+  store.trackBlocked('pane1', { messageId: 'm1', token: 't1', options: ['a'] });
+  store.setAwaitingText('pane1');
+
+  store.expirePane('pane1');
+  assert.equal(store.isAwaitingText('pane1'), false);
+});
+
+test('registerMessage maps an additional message id to the pane', () => {
+  const store = new RelayStateStore();
+  store.trackBlocked('pane1', { messageId: 'm1', token: 't1', options: ['a'] });
+
+  store.registerMessage('m-prompt', 'pane1');
+  assert.equal(store.resolveByMessageId('m-prompt'), 'pane1');
+
+  store.expirePane('pane1');
+  assert.equal(store.resolveByMessageId('m-prompt'), null);
+});
+
 test('corrupt JSON on disk falls back to the empty default state without throwing', () => {
   writeStateFile('{ not valid json');
 
