@@ -85,12 +85,55 @@ test('transition into unknown emits nothing', () => {
   assert.deepEqual(events, []);
 });
 
-test('disappeared pane is pruned; reappearing counts as first sighting', () => {
+test('a brand-new pane that appears already blocked (after the watcher has a baseline) emits a blocked event', () => {
+  const watcher = new StateWatcher();
+  watcher.update([agent('p1', 'working')]); // establishes the baseline
+  const events = watcher.update([agent('p1', 'working'), agent('p2', 'blocked')]);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].paneId, 'p2');
+  assert.equal(events[0].type, 'blocked');
+});
+
+test('a brand-new pane that appears already done (after the watcher has a baseline) emits a done event', () => {
+  const watcher = new StateWatcher();
+  watcher.update([]); // establishes an (empty) baseline
+  const events = watcher.update([agent('p1', 'done')]);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].paneId, 'p1');
+  assert.equal(events[0].type, 'done');
+});
+
+test('a brand-new pane that appears already idle (after the watcher has a baseline) emits nothing', () => {
+  const watcher = new StateWatcher();
+  watcher.update([]); // establishes an (empty) baseline
+  const events = watcher.update([agent('p1', 'idle')]);
+  assert.deepEqual(events, []);
+});
+
+test('reset() makes the next update() a fresh cold start: even a blocked pane emits nothing', () => {
+  const watcher = new StateWatcher();
+  watcher.update([agent('p1', 'working')]);
+  watcher.reset();
+  const events = watcher.update([agent('p1', 'blocked'), agent('p2', 'done')]);
+  assert.deepEqual(events, []);
+});
+
+test('disappeared pane is pruned; reappearing idle (needs from===working) emits nothing', () => {
   const watcher = new StateWatcher();
   watcher.update([agent('p1', 'working')]);
   watcher.update([]);
   const events = watcher.update([agent('p1', 'idle')]);
   assert.deepEqual(events, []);
+});
+
+test('disappeared pane is pruned; reappearing blocked emits a blocked event (this is a live agent again, worth surfacing)', () => {
+  const watcher = new StateWatcher();
+  watcher.update([agent('p1', 'working')]);
+  watcher.update([]);
+  const events = watcher.update([agent('p1', 'blocked')]);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].paneId, 'p1');
+  assert.equal(events[0].type, 'blocked');
 });
 
 test('non-array input returns no events and keeps state', () => {

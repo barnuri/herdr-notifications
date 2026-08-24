@@ -83,3 +83,46 @@ test('corrupt JSON falls back to defaults', () => {
   writeConfigFile('{ not valid json');
   assert.deepEqual(loadConfig(), DEFAULTS);
 });
+
+test('relay defaults to disabled with documented contextLines/pollMs when config is empty', () => {
+  writeConfigFile({});
+  const config = loadConfig();
+  assert.deepEqual(config.relay, { enabled: false, contextLines: 40, pollMs: 1000 });
+  assert.deepEqual(config.relay, DEFAULTS.relay);
+});
+
+test('relay.enabled boolean coercion falls back to default when non-boolean', () => {
+  writeConfigFile({ relay: { enabled: 'yes' } });
+  assert.equal(loadConfig().relay.enabled, DEFAULTS.relay.enabled);
+  writeConfigFile({ relay: { enabled: true } });
+  assert.equal(loadConfig().relay.enabled, true);
+});
+
+test('relay.contextLines accepts numeric and numeric-string input', () => {
+  writeConfigFile({ relay: { contextLines: 75 } });
+  assert.equal(loadConfig().relay.contextLines, 75);
+  writeConfigFile({ relay: { contextLines: '30' } });
+  assert.equal(loadConfig().relay.contextLines, 30);
+});
+
+test('relay.contextLines is clamped to the documented [1, 200] range', () => {
+  writeConfigFile({ relay: { contextLines: 0 } });
+  assert.equal(loadConfig().relay.contextLines, 1);
+  writeConfigFile({ relay: { contextLines: 500 } });
+  assert.equal(loadConfig().relay.contextLines, 200);
+});
+
+test('relay.pollMs accepts numeric/numeric-string input and clamps independently of top-level pollMs', () => {
+  writeConfigFile({ pollMs: 5000, relay: { pollMs: 100 } });
+  const config = loadConfig();
+  assert.equal(config.pollMs, 5000);
+  assert.equal(config.relay.pollMs, 500);
+  writeConfigFile({ relay: { pollMs: '2500' } });
+  assert.equal(loadConfig().relay.pollMs, 2500);
+});
+
+test('partial relay config fills missing keys from defaults', () => {
+  writeConfigFile({ relay: { enabled: true } });
+  const config = loadConfig();
+  assert.deepEqual(config.relay, { enabled: true, contextLines: DEFAULTS.relay.contextLines, pollMs: DEFAULTS.relay.pollMs });
+});
