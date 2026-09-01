@@ -124,6 +124,25 @@ Config lives at `$HERDR_PLUGIN_CONFIG_DIR/config.json` (fallback:
 | `relay.contextLines` | `40` | Lines of recent pane output to capture and show for a blocked agent (1–200). |
 | `relay.pollMs` | `1000` | How often to poll Telegram for replies (minimum 500). Independent of `pollMs`. |
 
+### Notification filter
+
+`notifyOn` decides which of the three types actually reach Telegram. The plugin's **Cycle
+Telegram notification filter** action steps through three presets without editing JSON:
+
+| Preset | Sends | Use when |
+|---|---|---|
+| `all` | blocked 🔴 + idle 🟡 + done 🟢 | you want every state change |
+| `needs-me` | blocked 🔴 + idle 🟡 | you only want pings when an agent is waiting on you |
+| `blocked-only` | blocked 🔴 | you only want approval/input prompts |
+
+Each run advances to the next preset and shows a desktop toast with the new setting. Any
+hand-edited combination counts as custom, and the next run resets it to `all`. To set one
+directly instead of cycling:
+
+```bash
+node bin/notify-filter.js needs-me
+```
+
 **Defaults are opt-out**: every notification type is enabled by default, and any key missing
 from the file falls back to its default — an empty `{}` config (with token + chat id) means
 "send me everything". Enable-all is therefore just removing the `notifyOn` block (or setting

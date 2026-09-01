@@ -19,3 +19,9 @@ id = "edit-config"
 title = "Edit Telegram notification settings"
 contexts = ["workspace", "pane"]
 command = ["node", "bin/edit-config.js"]
+
+[[actions]]
+id = "notify-filter"
+title = "Cycle Telegram notification filter"
+contexts = ["workspace", "pane"]
+command = ["node", "bin/notify-filter.js"]

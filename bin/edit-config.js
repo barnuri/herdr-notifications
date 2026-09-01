@@ -2,14 +2,12 @@
 
 const fs = require('node:fs');
 
-const { DEFAULTS, configDir, configPath } = require('../lib/config');
+const { DEFAULTS, configDir, configPath, writeConfig } = require('../lib/config');
 const { runHerdr, notifyDesktop } = require('../lib/herdr');
 
 const NOTIFICATION_TITLE = 'Telegram Notifications';
 const CONFIG_TAB_LABEL = 'telegram-config';
 const DEFAULT_EDITOR = 'vi';
-// The config file holds the bot token, so it must not be group/world readable.
-const CONFIG_FILE_MODE = 0o600;
 
 // 'pane run' takes a single shell command string, so the path must be quoted.
 function shellQuote(value) {
@@ -26,11 +24,10 @@ function findPaneId(created) {
 
 // Materialize the config file (with defaults) so the editor has something to open.
 function ensureConfigFile() {
-  fs.mkdirSync(configDir(), { recursive: true });
   if (fs.existsSync(configPath())) {
     return;
   }
-  fs.writeFileSync(configPath(), `${JSON.stringify(DEFAULTS, null, 2)}\n`, { mode: CONFIG_FILE_MODE });
+  writeConfig(DEFAULTS);
 }
 
 async function main() {

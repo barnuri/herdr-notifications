@@ -1,0 +1,91 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { test, beforeEach, afterEach } = require('node:test');
+
+const { PRESETS, CUSTOM_PRESET_ID, findPreset, matchPresetId, nextPreset } = require('../lib/notify-filter');
+const { resolvePreset } = require('../bin/notify-filter');
+const { loadConfig, updateConfig, configPath } = require('../lib/config');
+
+let tempConfigDir;
+let previousConfigDirEnv;
+
+beforeEach(() => {
+  previousConfigDirEnv = process.env.HERDR_PLUGIN_CONFIG_DIR;
+  tempConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'herdr-telegram-filter-'));
+  process.env.HERDR_PLUGIN_CONFIG_DIR = tempConfigDir;
+});
+
+afterEach(() => {
+  if (previousConfigDirEnv === undefined) {
+    delete process.env.HERDR_PLUGIN_CONFIG_DIR;
+  } else {
+    process.env.HERDR_PLUGIN_CONFIG_DIR = previousConfigDirEnv;
+  }
+  fs.rmSync(tempConfigDir, { recursive: true, force: true });
+});
+
+test('needs-me preset covers blocked and idle but not done', () => {
+  assert.deepEqual(findPreset('needs-me').notifyOn, { idle: true, blocked: true, done: false });
+});
+
+test('matchPresetId names a known combination and flags anything else custom', () => {
+  assert.equal(matchPresetId({ idle: true, blocked: true, done: true }), 'all');
+  assert.equal(matchPresetId({ idle: true, blocked: true, done: false }), 'needs-me');
+  assert.equal(matchPresetId({ idle: false, blocked: true, done: false }), 'blocked-only');
+  assert.equal(matchPresetId({ idle: true, blocked: false, done: true }), CUSTOM_PRESET_ID);
+  assert.equal(matchPresetId(null), CUSTOM_PRESET_ID);
+});
+
+test('nextPreset cycles through every preset and wraps around', () => {
+  const visited = [];
+  let current = PRESETS[0].id;
+  for (let step = 0; step < PRESETS.length; step += 1) {
+    current = nextPreset(current).id;
+    visited.push(current);
+  }
+  assert.deepEqual(visited, [...PRESETS.slice(1).map((preset) => preset.id), PRESETS[0].id]);
+});
+
+test('nextPreset sends a custom combination back to the first preset', () => {
+  assert.equal(nextPreset(CUSTOM_PRESET_ID).id, PRESETS[0].id);
+});
+
+test('resolvePreset with no argument advances from the current notifyOn', () => {
+  assert.equal(resolvePreset(undefined, { idle: true, blocked: true, done: true }).id, 'needs-me');
+});
+
+test('resolvePreset with an explicit id sets it directly', () => {
+  assert.equal(resolvePreset('blocked-only', { idle: true, blocked: true, done: true }).id, 'blocked-only');
+});
+
+test('resolvePreset rejects an unknown preset id', () => {
+  assert.throws(() => resolvePreset('nope', {}), /unknown preset "nope"/);
+});
+
+test('applying a preset rewrites notifyOn and preserves other config keys', () => {
+  fs.writeFileSync(
+    configPath(),
+    JSON.stringify({ botToken: 'token', chatId: '42', notifyOn: { idle: true, blocked: true, done: true }, futureKey: 7 }),
+  );
+
+  const preset = findPreset('needs-me');
+  updateConfig((raw) => ({ ...raw, notifyOn: { ...preset.notifyOn } }));
+
+  const written = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
+  assert.deepEqual(written.notifyOn, { idle: true, blocked: true, done: false });
+  assert.equal(written.botToken, 'token');
+  assert.equal(written.futureKey, 7);
+  assert.equal(loadConfig().notifyOn.done, false);
+});
+
+test('applying a preset to a missing config file creates it with mode 0600', () => {
+  const preset = findPreset('blocked-only');
+  updateConfig((raw) => ({ ...raw, notifyOn: { ...preset.notifyOn } }));
+
+  assert.equal(fs.statSync(configPath()).mode & 0o777, 0o600);
+  assert.deepEqual(loadConfig().notifyOn, { idle: false, blocked: true, done: false });
+});
