@@ -4,7 +4,7 @@ const { loadConfig, updateConfig } = require('../lib/config');
 const { PRESETS, findPreset, matchPresetId, nextPreset } = require('../lib/notify-filter');
 const { notifyDesktop } = require('../lib/herdr');
 
-const NOTIFICATION_TITLE = 'Telegram Notifications';
+const NOTIFICATION_TITLE = 'Herdr Notifications';
 
 function usage() {
   const ids = PRESETS.map((preset) => preset.id).join(' | ');
@@ -32,7 +32,7 @@ async function main() {
 
 if (require.main === module) {
   main().catch((error) => {
-    process.stderr.write(`herdr-telegram-notifications: notify-filter failed: ${error.message}\n`);
+    process.stderr.write(`herdr-notifications: notify-filter failed: ${error.message}\n`);
     process.exit(1);
   });
 }

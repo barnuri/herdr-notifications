@@ -1,7 +1,7 @@
 {
-    "name": "herdr-telegram-notifications",
-    "version": "0.1.0",
-    "description": "Telegram notifications plugin for herdr — get a Telegram message when an agent goes idle, gets blocked, or finishes",
+    "name": "herdr-notifications",
+    "version": "0.2.0",
+    "description": "Multi-provider notifications plugin for herdr — get a Telegram, Discord and/or Slack message when an agent goes idle, gets blocked, or finishes",
     "author": "barnuri",
     "license": "MIT",
     "type": "commonjs",
@@ -9,8 +9,8 @@
         "node": ">=22.0.0"
     },
     "scripts": {
-        "test": "node --test \"tests/*.test.js\"",
+        "test": "node --test \"tests/**/*.test.js\"",
         "test:e2e": "node bin/e2e-option-detector.js"
     },
-    "keywords": ["herdr", "herdr-plugin", "telegram", "notifications", "terminal"]
+    "keywords": ["herdr", "herdr-plugin", "notifications", "telegram", "discord", "slack", "terminal"]
 }

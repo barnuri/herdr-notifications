@@ -5,8 +5,8 @@ const fs = require('node:fs');
 const { DEFAULTS, configDir, configPath, writeConfig } = require('../lib/config');
 const { runHerdr, notifyDesktop } = require('../lib/herdr');
 
-const NOTIFICATION_TITLE = 'Telegram Notifications';
-const CONFIG_TAB_LABEL = 'telegram-config';
+const NOTIFICATION_TITLE = 'Herdr Notifications';
+const CONFIG_TAB_LABEL = 'notifications-config';
 const DEFAULT_EDITOR = 'vi';
 
 // 'pane run' takes a single shell command string, so the path must be quoted.
@@ -53,7 +53,7 @@ async function main() {
 
 if (require.main === module) {
   main().catch((error) => {
-    process.stderr.write(`herdr-telegram-notifications: edit-config failed: ${error.message}\n`);
+    process.stderr.write(`herdr-notifications: edit-config failed: ${error.message}\n`);
     process.exit(1);
   });
 }

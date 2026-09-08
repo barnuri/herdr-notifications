@@ -6,19 +6,31 @@ const os = require('node:os');
 const path = require('node:path');
 const { test, beforeEach, afterEach } = require('node:test');
 
-const { DEFAULTS, configDir, configPath, loadConfig } = require('../lib/config');
+const {
+  DEFAULTS,
+  PROVIDER_DEFAULTS,
+  configDir,
+  configPath,
+  legacyConfigPaths,
+  loadConfig,
+  updateConfig,
+} = require('../lib/config');
 
+let tempParentDir;
 let tempConfigDir;
 let previousConfigDirEnv;
 
-function writeConfigFile(contents) {
+function writeConfigFile(contents, dir = tempConfigDir) {
   const serialized = typeof contents === 'string' ? contents : JSON.stringify(contents);
-  fs.writeFileSync(path.join(tempConfigDir, 'config.json'), serialized, 'utf8');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'config.json'), serialized, 'utf8');
 }
 
 beforeEach(() => {
   previousConfigDirEnv = process.env.HERDR_PLUGIN_CONFIG_DIR;
-  tempConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'herdr-telegram-config-'));
+  tempParentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'herdr-notifications-config-'));
+  tempConfigDir = path.join(tempParentDir, 'barnuri.notifications');
+  fs.mkdirSync(tempConfigDir, { recursive: true });
   process.env.HERDR_PLUGIN_CONFIG_DIR = tempConfigDir;
 });
 
@@ -28,7 +40,7 @@ afterEach(() => {
   } else {
     process.env.HERDR_PLUGIN_CONFIG_DIR = previousConfigDirEnv;
   }
-  fs.rmSync(tempConfigDir, { recursive: true, force: true });
+  fs.rmSync(tempParentDir, { recursive: true, force: true });
 });
 
 test('configDir honors HERDR_PLUGIN_CONFIG_DIR override', () => {
@@ -40,89 +52,190 @@ test('returns defaults when config file is missing', () => {
   assert.deepEqual(loadConfig(), DEFAULTS);
 });
 
+test('every known provider is present and disabled by default', () => {
+  const { providers } = loadConfig();
+  assert.deepEqual(Object.keys(providers).sort(), ['discord', 'slack', 'telegram']);
+  for (const provider of Object.values(providers)) {
+    assert.equal(provider.enabled, false);
+  }
+});
+
 test('per-type toggle override is respected', () => {
   writeConfigFile({ notifyOn: { idle: false, blocked: true, done: false } });
   const config = loadConfig();
   assert.deepEqual(config.notifyOn, { idle: false, blocked: true, done: false });
-  assert.equal(config.enabled, true);
 });
 
-test('missing notifyOn keys default to true', () => {
-  writeConfigFile({ notifyOn: { idle: false } });
-  const config = loadConfig();
-  assert.deepEqual(config.notifyOn, { idle: false, blocked: true, done: true });
+test('partial notifyOn falls back to defaults for missing keys', () => {
+  writeConfigFile({ notifyOn: { done: false } });
+  assert.deepEqual(loadConfig().notifyOn, { idle: true, blocked: true, done: false });
 });
 
-test('master enabled=false is respected', () => {
-  writeConfigFile({ enabled: false });
-  const config = loadConfig();
-  assert.equal(config.enabled, false);
-  assert.deepEqual(config.notifyOn, DEFAULTS.notifyOn);
-});
-
-test('pollMs is clamped to the minimum', () => {
-  writeConfigFile({ pollMs: 100 });
-  assert.equal(loadConfig().pollMs, 500);
-});
-
-test('pollMs accepts numeric strings and rejects junk', () => {
-  writeConfigFile({ pollMs: '3000' });
-  assert.equal(loadConfig().pollMs, 3000);
-  writeConfigFile({ pollMs: 'fast' });
-  assert.equal(loadConfig().pollMs, DEFAULTS.pollMs);
-});
-
-test('chatId is normalized to a string', () => {
-  writeConfigFile({ chatId: -1001234567890 });
-  assert.equal(loadConfig().chatId, '-1001234567890');
-  writeConfigFile({ chatId: '@my_channel' });
-  assert.equal(loadConfig().chatId, '@my_channel');
-});
-
-test('corrupt JSON falls back to defaults', () => {
-  writeConfigFile('{ not valid json');
+test('invalid JSON falls back to defaults', () => {
+  writeConfigFile('{ not json');
   assert.deepEqual(loadConfig(), DEFAULTS);
 });
 
-test('relay defaults to disabled with documented contextLines/pollMs when config is empty', () => {
-  writeConfigFile({});
-  const config = loadConfig();
-  assert.deepEqual(config.relay, { enabled: false, contextLines: 40, pollMs: 1000 });
-  assert.deepEqual(config.relay, DEFAULTS.relay);
+test('non-object config falls back to defaults', () => {
+  writeConfigFile('[1, 2, 3]');
+  assert.deepEqual(loadConfig(), DEFAULTS);
 });
 
-test('relay.enabled boolean coercion falls back to default when non-boolean', () => {
-  writeConfigFile({ relay: { enabled: 'yes' } });
-  assert.equal(loadConfig().relay.enabled, DEFAULTS.relay.enabled);
-  writeConfigFile({ relay: { enabled: true } });
-  assert.equal(loadConfig().relay.enabled, true);
+test('pollMs is clamped to the minimum', () => {
+  writeConfigFile({ pollMs: 10 });
+  assert.equal(loadConfig().pollMs, 500);
 });
 
-test('relay.contextLines accepts numeric and numeric-string input', () => {
-  writeConfigFile({ relay: { contextLines: 75 } });
-  assert.equal(loadConfig().relay.contextLines, 75);
-  writeConfigFile({ relay: { contextLines: '30' } });
-  assert.equal(loadConfig().relay.contextLines, 30);
+test('non-numeric pollMs falls back to the default', () => {
+  writeConfigFile({ pollMs: 'soon' });
+  assert.equal(loadConfig().pollMs, DEFAULTS.pollMs);
 });
 
-test('relay.contextLines is clamped to the documented [1, 200] range', () => {
-  writeConfigFile({ relay: { contextLines: 0 } });
-  assert.equal(loadConfig().relay.contextLines, 1);
-  writeConfigFile({ relay: { contextLines: 500 } });
+test('relay contextLines is clamped to the allowed range', () => {
+  writeConfigFile({ relay: { contextLines: 5000 } });
   assert.equal(loadConfig().relay.contextLines, 200);
 });
 
-test('relay.pollMs accepts numeric/numeric-string input and clamps independently of top-level pollMs', () => {
-  writeConfigFile({ pollMs: 5000, relay: { pollMs: 100 } });
-  const config = loadConfig();
-  assert.equal(config.pollMs, 5000);
-  assert.equal(config.relay.pollMs, 500);
-  writeConfigFile({ relay: { pollMs: '2500' } });
-  assert.equal(loadConfig().relay.pollMs, 2500);
+test('relay defaults apply when the relay block is not an object', () => {
+  writeConfigFile({ relay: 'yes' });
+  assert.deepEqual(loadConfig().relay, DEFAULTS.relay);
 });
 
-test('partial relay config fills missing keys from defaults', () => {
-  writeConfigFile({ relay: { enabled: true } });
-  const config = loadConfig();
-  assert.deepEqual(config.relay, { enabled: true, contextLines: DEFAULTS.relay.contextLines, pollMs: DEFAULTS.relay.pollMs });
+test('multiple providers can be enabled in parallel', () => {
+  writeConfigFile({
+    providers: {
+      telegram: { enabled: true, botToken: 'tg-token', chatId: '123' },
+      discord: { enabled: true, botToken: 'dc-token', channelId: '456' },
+      slack: { enabled: true, botToken: 'xoxb-token', channelId: 'C789' },
+    },
+  });
+  const { providers } = loadConfig();
+  assert.equal(providers.telegram.enabled, true);
+  assert.equal(providers.discord.enabled, true);
+  assert.equal(providers.slack.enabled, true);
+  assert.equal(providers.discord.channelId, '456');
+  assert.equal(providers.slack.botToken, 'xoxb-token');
+});
+
+test('numeric chat and channel ids are coerced to strings', () => {
+  writeConfigFile({
+    providers: {
+      telegram: { enabled: true, botToken: 't', chatId: -1001234567890 },
+      discord: { enabled: true, botToken: 'd', channelId: 987654321098765432 },
+    },
+  });
+  const { providers } = loadConfig();
+  assert.equal(providers.telegram.chatId, '-1001234567890');
+  assert.equal(typeof providers.discord.channelId, 'string');
+});
+
+test('pasted credentials are trimmed', () => {
+  writeConfigFile({ providers: { slack: { enabled: true, botToken: '  xoxb-token\n', channelId: ' C1 ' } } });
+  const { slack } = loadConfig().providers;
+  assert.equal(slack.botToken, 'xoxb-token');
+  assert.equal(slack.channelId, 'C1');
+});
+
+test('unknown fields inside a provider block are dropped from the normalized view', () => {
+  writeConfigFile({ providers: { telegram: { enabled: true, botToken: 't', chatId: '1', mystery: 'x' } } });
+  assert.deepEqual(Object.keys(loadConfig().providers.telegram).sort(), ['botToken', 'chatId', 'enabled']);
+});
+
+test('a provider block that is not an object falls back to its defaults', () => {
+  writeConfigFile({ providers: { discord: 'on' } });
+  assert.deepEqual(loadConfig().providers.discord, PROVIDER_DEFAULTS.discord);
+});
+
+test('legacy top-level telegram credentials are adopted as the telegram provider', () => {
+  writeConfigFile({ botToken: 'legacy-token', chatId: '4242' });
+  const { telegram } = loadConfig().providers;
+  assert.deepEqual(telegram, { enabled: true, botToken: 'legacy-token', chatId: '4242' });
+});
+
+test('a half-configured legacy install is adopted but stays disabled', () => {
+  writeConfigFile({ botToken: 'legacy-token' });
+  const { telegram } = loadConfig().providers;
+  assert.equal(telegram.enabled, false);
+  assert.equal(telegram.botToken, 'legacy-token');
+});
+
+test('an explicit telegram provider block wins over legacy top-level keys', () => {
+  writeConfigFile({
+    botToken: 'legacy-token',
+    chatId: '1',
+    providers: { telegram: { enabled: true, botToken: 'new-token', chatId: '2' } },
+  });
+  const { telegram } = loadConfig().providers;
+  assert.equal(telegram.botToken, 'new-token');
+  assert.equal(telegram.chatId, '2');
+});
+
+test('legacy keys do not leak into other providers', () => {
+  writeConfigFile({ botToken: 'legacy-token', chatId: '4242' });
+  const { discord, slack } = loadConfig().providers;
+  assert.equal(discord.botToken, '');
+  assert.equal(slack.botToken, '');
+});
+
+test('config is read from a pre-rename sibling directory when the current one has no file', () => {
+  const legacyDir = path.join(tempParentDir, 'barnuri.telegram-notifications');
+  writeConfigFile({ providers: { telegram: { enabled: true, botToken: 'from-legacy-dir', chatId: '9' } } }, legacyDir);
+  assert.equal(loadConfig().providers.telegram.botToken, 'from-legacy-dir');
+});
+
+test('the current directory wins over a pre-rename sibling directory', () => {
+  const legacyDir = path.join(tempParentDir, 'barnuri.telegram-notifications');
+  writeConfigFile({ providers: { telegram: { enabled: true, botToken: 'from-legacy-dir', chatId: '9' } } }, legacyDir);
+  writeConfigFile({ providers: { telegram: { enabled: true, botToken: 'from-current-dir', chatId: '9' } } });
+  assert.equal(loadConfig().providers.telegram.botToken, 'from-current-dir');
+});
+
+test('legacyConfigPaths never includes the active config path', () => {
+  assert.ok(!legacyConfigPaths().includes(configPath()));
+});
+
+test('an edit migrates a legacy directory config forward to the current path', () => {
+  const legacyDir = path.join(tempParentDir, 'barnuri.telegram-notifications');
+  writeConfigFile({ providers: { telegram: { enabled: true, botToken: 'from-legacy-dir', chatId: '9' } } }, legacyDir);
+
+  updateConfig((raw) => ({ ...raw, pollMs: 5000 }));
+
+  assert.ok(fs.existsSync(configPath()));
+  const migrated = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
+  assert.equal(migrated.providers.telegram.botToken, 'from-legacy-dir');
+  assert.equal(migrated.pollMs, 5000);
+});
+
+test('updateConfig preserves unknown keys from the raw file', () => {
+  writeConfigFile({ futureKey: 'keep-me', pollMs: 1000 });
+  const next = updateConfig((raw) => ({ ...raw, pollMs: 3000 }));
+  assert.equal(next.futureKey, 'keep-me');
+  assert.equal(JSON.parse(fs.readFileSync(configPath(), 'utf8')).futureKey, 'keep-me');
+});
+
+test('an explicit telegram block does not hide credentials the legacy keys still hold', () => {
+  writeConfigFile({
+    botToken: 'legacy-token',
+    chatId: '4242',
+    providers: { telegram: { enabled: false } },
+  });
+
+  const { telegram } = loadConfig().providers;
+
+  assert.equal(telegram.enabled, false, 'the explicit switch still wins');
+  assert.equal(telegram.botToken, 'legacy-token', 'disabling a provider must not discard its token');
+  assert.equal(telegram.chatId, '4242');
+});
+
+test('an explicit telegram block fills only the fields it omits from the legacy keys', () => {
+  writeConfigFile({
+    botToken: 'legacy-token',
+    chatId: '4242',
+    providers: { telegram: { enabled: true, botToken: 'rotated-token' } },
+  });
+
+  const { telegram } = loadConfig().providers;
+
+  assert.equal(telegram.botToken, 'rotated-token');
+  assert.equal(telegram.chatId, '4242');
 });

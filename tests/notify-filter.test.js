@@ -69,7 +69,14 @@ test('resolvePreset rejects an unknown preset id', () => {
 test('applying a preset rewrites notifyOn and preserves other config keys', () => {
   fs.writeFileSync(
     configPath(),
-    JSON.stringify({ botToken: 'token', chatId: '42', notifyOn: { idle: true, blocked: true, done: true }, futureKey: 7 }),
+    JSON.stringify({
+      providers: {
+        telegram: { enabled: true, botToken: 'token', chatId: '42' },
+        slack: { enabled: true, botToken: 'xoxb-token', channelId: 'C1' },
+      },
+      notifyOn: { idle: true, blocked: true, done: true },
+      futureKey: 7,
+    }),
   );
 
   const preset = findPreset('needs-me');
@@ -77,9 +84,11 @@ test('applying a preset rewrites notifyOn and preserves other config keys', () =
 
   const written = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
   assert.deepEqual(written.notifyOn, { idle: true, blocked: true, done: false });
-  assert.equal(written.botToken, 'token');
+  assert.equal(written.providers.telegram.botToken, 'token');
+  assert.equal(written.providers.slack.channelId, 'C1');
   assert.equal(written.futureKey, 7);
   assert.equal(loadConfig().notifyOn.done, false);
+  assert.equal(loadConfig().providers.slack.enabled, true, 'the filter action must not disturb provider settings');
 });
 
 test('applying a preset to a missing config file creates it with mode 0600', () => {

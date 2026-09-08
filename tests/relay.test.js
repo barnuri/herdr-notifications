@@ -1,527 +1,776 @@
 'use strict';
 
-const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const { test } = require('node:test');
 
 const { Relay } = require('../lib/relay');
+const { RelayStateStore } = require('../lib/relay-state');
 
-const CONFIG = Object.freeze({
-  botToken: 'tok',
-  chatId: '555',
-  relay: Object.freeze({ enabled: true, contextLines: 40, pollMs: 2000 }),
-});
+const BLOCKED_EVENT = { type: 'blocked', paneId: 'pane-1', agent: { agent: 'agent-a' } };
+const MENU_OPTIONS = [
+  { label: '1. Yes, proceed', value: '1' },
+  { label: '2. No', value: '2' },
+];
 
-function buildStateStore(overrides = {}) {
-  const calls = { setOffset: [], expirePane: [], trackBlocked: [], setAwaitingText: [], registerMessage: [] };
+function relayConfig(overrides = {}) {
   return {
-    calls,
-    getOffset: () => 0,
-    setOffset: (offset) => calls.setOffset.push(offset),
-    resolveByToken: overrides.resolveByToken || (() => null),
-    resolveByMessageId: overrides.resolveByMessageId || (() => null),
-    resolveOptionsByPane: overrides.resolveOptionsByPane || (() => null),
-    getBlockedPanes: overrides.getBlockedPanes || (() => []),
-    isAwaitingText: overrides.isAwaitingText || (() => false),
-    setAwaitingText: (paneId) => calls.setAwaitingText.push(paneId),
-    registerMessage: (messageId, paneId) => calls.registerMessage.push({ messageId, paneId }),
-    expirePane: (paneId) => calls.expirePane.push(paneId),
-    trackBlocked: (paneId, args) => calls.trackBlocked.push({ paneId, args }),
+    enabled: true,
+    pollMs: 2000,
+    notifyOn: { idle: true, blocked: true, done: true },
+    relay: { enabled: true, contextLines: 40, pollMs: 1000 },
+    providers: {},
+    ...overrides,
   };
 }
 
-// Builds a Relay with a plain recording stub for every constructor-DI
-// collaborator, matching lib/relay.js's constructor destructuring exactly.
-// Overrides let individual tests swap in the collaborator(s) they're driving.
-function buildRelay(overrides = {}) {
-  const calls = {
-    readAgentOutput: [],
-    answerBlockedAgent: [],
-    notifyDesktop: [],
-    sendMessage: [],
-    getUpdates: [],
-    answerCallbackQuery: [],
-    editMessageText: [],
-    detectOptions: [],
-    log: [],
-  };
-  const stateStore = overrides.stateStore || buildStateStore();
-  const relay = new Relay({
-    loadConfig: overrides.loadConfig || (() => CONFIG),
-    readAgentOutput:
-      overrides.readAgentOutput ||
-      (async (paneId, opts) => {
-        calls.readAgentOutput.push({ paneId, opts });
-        return '';
-      }),
-    answerBlockedAgent:
-      overrides.answerBlockedAgent ||
-      (async (paneId, text) => {
-        calls.answerBlockedAgent.push({ paneId, text });
-      }),
-    notifyDesktop:
-      overrides.notifyDesktop ||
-      (async (title, body) => {
-        calls.notifyDesktop.push({ title, body });
-        return true;
-      }),
-    sendMessage:
-      overrides.sendMessage ||
-      (async (args) => {
-        calls.sendMessage.push(args);
-        return { message_id: 999 };
-      }),
-    getUpdates:
-      overrides.getUpdates ||
-      (async (botToken, opts) => {
-        calls.getUpdates.push({ botToken, opts });
-        return [];
-      }),
-    answerCallbackQuery:
-      overrides.answerCallbackQuery ||
-      (async (botToken, id, opts) => {
-        calls.answerCallbackQuery.push({ botToken, id, opts });
-      }),
-    editMessageText:
-      overrides.editMessageText ||
-      (async (args) => {
-        calls.editMessageText.push(args);
-      }),
-    detectOptions:
-      overrides.detectOptions ||
-      ((text) => {
-        calls.detectOptions.push(text);
-        return [];
-      }),
-    stateStore,
-    log: overrides.log || ((line) => calls.log.push(line)),
-  });
-  return { relay, calls, stateStore };
-}
-
-function callbackUpdate({ updateId, chatId = '555', data = 'r:abc123:0' } = {}) {
+// A provider double that records every outbound call and replays a queue of
+// inbound batches, one per fetchInbound call.
+function fakeProvider(id, { inbound = [], failSendBlocked = null, failMarkAnswered = false } = {}) {
+  const batches = [...inbound];
   return {
-    update_id: updateId,
-    callback_query: {
-      id: 'cbq1',
-      data,
-      message: { message_id: 5, chat: { id: chatId } },
+    id,
+    targetId: `target-${id}`,
+    supportsButtons: id === 'telegram',
+    blocked: [],
+    texts: [],
+    prompts: [],
+    answered: [],
+    acknowledged: [],
+    fetched: [],
+    isConfigured: () => true,
+    async sendBlocked({ event, context, options, token }) {
+      if (failSendBlocked) {
+        throw new Error(failSendBlocked);
+      }
+      this.blocked.push({ event, context, options, token });
+      return { messageId: `${id}-msg-${this.blocked.length}`, baseText: `${id} base` };
+    },
+    async sendText(text) {
+      this.texts.push(text);
+      return { messageId: `${id}-text-${this.texts.length}` };
+    },
+    async sendTextPrompt(text) {
+      this.prompts.push(text);
+      return { messageId: `${id}-prompt-${this.prompts.length}` };
+    },
+    async markAnswered(payload) {
+      if (failMarkAnswered) {
+        throw new Error('too old to edit');
+      }
+      this.answered.push(payload);
+    },
+    async acknowledgeAction(actionId, text) {
+      this.acknowledged.push({ actionId, text });
+    },
+    async fetchInbound(cursor) {
+      this.fetched.push(cursor);
+      const batch = batches.shift() || { events: [], cursor };
+      return batch;
     },
   };
 }
 
-function messageUpdate({ updateId, chatId = '555', text = 'hello', replyToMessageId } = {}) {
-  return {
-    update_id: updateId,
-    message: {
-      message_id: 6,
-      chat: { id: chatId },
-      text,
-      ...(replyToMessageId !== undefined ? { reply_to_message: { message_id: replyToMessageId } } : {}),
+// An in-memory stand-in for RelayStateStore with the same surface, so relay
+// behaviour is tested without touching the filesystem.
+function fakeStore() {
+  const state = { cursors: {}, blockedPanes: [], messages: {}, deliveries: {}, questions: {}, tokens: {}, awaitingText: {} };
+  const store = {
+    state,
+    getCursor: (providerId, targetId) => {
+      const entry = state.cursors[providerId];
+      if (!entry) {
+        return undefined;
+      }
+      return entry.target === null || String(entry.target) === String(targetId) ? entry.cursor : undefined;
     },
-  };
-}
-
-test('pollUpdates drops a callback_query update from an unconfigured chat but still advances the offset', async () => {
-  const update = callbackUpdate({ updateId: 1, chatId: 'someone-else' });
-  const { relay, calls, stateStore } = buildRelay({
-    getUpdates: async () => [update],
-  });
-
-  await relay.pollUpdates();
-
-  assert.equal(calls.answerBlockedAgent.length, 0);
-  assert.equal(calls.answerCallbackQuery.length, 0);
-  assert.equal(calls.sendMessage.length, 0);
-  assert.deepEqual(stateStore.calls.setOffset, [2]);
-});
-
-test('pollUpdates drops a plain message update from an unconfigured chat but still advances the offset', async () => {
-  const update = messageUpdate({ updateId: 1, chatId: 'someone-else' });
-  const { relay, calls, stateStore } = buildRelay({
-    getUpdates: async () => [update],
-  });
-
-  await relay.pollUpdates();
-
-  assert.equal(calls.answerBlockedAgent.length, 0);
-  assert.equal(calls.answerCallbackQuery.length, 0);
-  assert.equal(calls.sendMessage.length, 0);
-  assert.deepEqual(stateStore.calls.setOffset, [2]);
-});
-
-test('pollUpdates resolves a callback_query with a valid token: answers the callback, relays the option value, then expires the pane', async () => {
-  const stateStore = buildStateStore({
-    resolveByToken: (token) => (token === 'abc123' ? { paneId: 'p1', options: [{ label: 'Yes', value: 'y' }] } : null),
-  });
-  const update = callbackUpdate({ updateId: 1, data: 'r:abc123:0' });
-  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
-
-  await relay.pollUpdates();
-
-  assert.deepEqual(calls.answerCallbackQuery, [{ botToken: 'tok', id: 'cbq1', opts: { text: 'Sent.' } }]);
-  assert.deepEqual(calls.answerBlockedAgent, [{ paneId: 'p1', text: 'y' }]);
-  assert.deepEqual(stateStore.calls.expirePane, ['p1']);
-  // No `text` was tracked for this entry (older/partial state) — the edit
-  // step is skipped rather than editing with an incomplete message body.
-  assert.equal(calls.editMessageText.length, 0);
-});
-
-test('a successful callback_query edits the original message to show the selection and remove the buttons', async () => {
-  const stateStore = buildStateStore({
-    resolveByToken: (token) =>
-      (token === 'abc123' ? { paneId: 'p1', options: [{ label: '2. No, exit', value: '2' }], text: '🔴 <b>agent</b> is blocked' } : null),
-  });
-  const update = callbackUpdate({ updateId: 1, data: 'r:abc123:0' });
-  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
-
-  await relay.pollUpdates();
-
-  assert.equal(calls.editMessageText.length, 1);
-  const edit = calls.editMessageText[0];
-  assert.equal(edit.chatId, CONFIG.chatId);
-  assert.equal(edit.messageId, 5); // callbackUpdate()'s fixed message.message_id
-  assert.match(edit.text, /🔴 <b>agent<\/b> is blocked/);
-  assert.match(edit.text, /✅ Selected: <b>2\. No, exit<\/b>/);
-  assert.deepEqual(edit.replyMarkup, { inline_keyboard: [] });
-});
-
-test('a callback_query edit failure is logged, not surfaced as a relay failure (the answer was already delivered)', async () => {
-  const stateStore = buildStateStore({
-    resolveByToken: (token) => (token === 'abc123' ? { paneId: 'p1', options: [{ label: 'Yes', value: 'y' }], text: 'body' } : null),
-  });
-  const update = callbackUpdate({ updateId: 1, data: 'r:abc123:0' });
-  const { relay, calls } = buildRelay({
-    stateStore,
-    getUpdates: async () => [update],
-    editMessageText: async () => {
-      throw new Error('message to edit not found');
+    setCursor: (providerId, cursor, targetId) => {
+      state.cursors[providerId] = { cursor, target: targetId === undefined ? null : String(targetId) };
     },
-  });
-
-  await relay.pollUpdates();
-
-  assert.equal(calls.sendMessage.length, 0); // no user-facing "Failed to relay" message
-  assert.equal(calls.log.length, 1);
-  assert.match(calls.log[0], /failed to update the answered message/);
-});
-
-test('pollUpdates routes a reply-to-notification message to the replied-to pane', async () => {
-  const stateStore = buildStateStore({
-    resolveByMessageId: (messageId) => (messageId === 5 ? 'p2' : null),
-  });
-  const update = messageUpdate({ updateId: 1, text: 'my answer', replyToMessageId: 5 });
-  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
-
-  await relay.pollUpdates();
-
-  assert.deepEqual(calls.answerBlockedAgent, [{ paneId: 'p2', text: 'my answer' }]);
-  assert.deepEqual(stateStore.calls.expirePane, ['p2']);
-  assert.equal(calls.sendMessage.length, 0);
-});
-
-test('pollUpdates routes a non-reply message to the single blocked pane when exactly one is blocked', async () => {
-  const stateStore = buildStateStore({ getBlockedPanes: () => ['p3'] });
-  const update = messageUpdate({ updateId: 1, text: 'my answer' });
-  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
-
-  await relay.pollUpdates();
-
-  assert.deepEqual(calls.answerBlockedAgent, [{ paneId: 'p3', text: 'my answer' }]);
-  assert.deepEqual(stateStore.calls.expirePane, ['p3']);
-  assert.equal(calls.sendMessage.length, 0);
-});
-
-test('pollUpdates rejects a non-reply message with no blocked panes: sends an explanatory error, never relays', async () => {
-  const stateStore = buildStateStore({ getBlockedPanes: () => [] });
-  const update = messageUpdate({ updateId: 1, text: 'my answer' });
-  const { relay, calls, stateStore: store } = buildRelay({ stateStore, getUpdates: async () => [update] });
-
-  await relay.pollUpdates();
-
-  assert.equal(calls.answerBlockedAgent.length, 0);
-  assert.equal(calls.sendMessage.length, 1);
-  assert.equal(calls.sendMessage[0].chatId, CONFIG.chatId);
-  assert.match(calls.sendMessage[0].text, /reply directly/);
-  assert.equal(store.calls.expirePane.length, 0);
-});
-
-test('pollUpdates rejects a non-reply message with two-or-more blocked panes: sends an explanatory error, never relays', async () => {
-  const stateStore = buildStateStore({ getBlockedPanes: () => ['p1', 'p2'] });
-  const update = messageUpdate({ updateId: 1, text: 'my answer' });
-  const { relay, calls, stateStore: store } = buildRelay({ stateStore, getUpdates: async () => [update] });
-
-  await relay.pollUpdates();
-
-  assert.equal(calls.answerBlockedAgent.length, 0);
-  assert.equal(calls.sendMessage.length, 1);
-  assert.equal(calls.sendMessage[0].chatId, CONFIG.chatId);
-  assert.match(calls.sendMessage[0].text, /reply directly/);
-  assert.equal(store.calls.expirePane.length, 0);
-});
-
-test('pollUpdates advances the offset to (max update_id + 1) exactly once, regardless of how many updates were processed or dropped', async () => {
-  const stateStore = buildStateStore({ getBlockedPanes: () => ['p1'] });
-  const updates = [
-    callbackUpdate({ updateId: 3, chatId: 'someone-else' }), // dropped: wrong chat
-    messageUpdate({ updateId: 7, text: 'my answer' }), // processed: routes to the sole blocked pane
-    messageUpdate({ updateId: 5, chatId: 'someone-else' }), // dropped: wrong chat, lower id than max
-  ];
-  const { relay, stateStore: store } = buildRelay({ stateStore, getUpdates: async () => updates });
-
-  await relay.pollUpdates();
-
-  assert.deepEqual(store.calls.setOffset, [8]);
-});
-
-test('pollUpdates advances the offset past the whole batch even when processing one update throws', async () => {
-  const stateStore = buildStateStore({
-    resolveByToken: (token) => (token === 'abc123' ? { paneId: 'p1', options: [{ label: 'Yes', value: 'y' }] } : null),
-  });
-  const updates = [
-    callbackUpdate({ updateId: 1, data: 'r:abc123:0' }),
-    callbackUpdate({ updateId: 2, data: 'r:abc123:0' }),
-  ];
-  let calls = 0;
-  const { relay, stateStore: store } = buildRelay({
-    stateStore,
-    getUpdates: async () => updates,
-    answerCallbackQuery: async () => {
-      calls += 1;
-      if (calls === 2) {
-        throw new Error('Telegram: query is too old and response timeout expired');
+    trackBlocked: (paneId, { deliveries = [], token, options, event } = {}) => {
+      // The real store expires the pane first, dropping the previous
+      // question's token and message routing.
+      store.expirePane(paneId);
+      state.blockedPanes = state.blockedPanes.filter((pane) => pane !== paneId).concat(paneId);
+      state.deliveries[paneId] = deliveries;
+      state.questions[paneId] = { event, optionsKey: RelayStateStore.optionsKey(options) };
+      for (const { providerId, messageId } of deliveries) {
+        state.messages[`${providerId}:${messageId}`] = paneId;
+      }
+      if (Array.isArray(options) && options.length > 0 && token !== undefined) {
+        state.tokens[token] = { paneId, options };
       }
     },
-  });
-
-  await relay.pollUpdates();
-
-  assert.deepEqual(store.calls.setOffset, [3]);
-});
-
-test('_handleCallbackQuery answers "expired" and does not relay when the token is unresolvable', async () => {
-  const update = callbackUpdate({ updateId: 1, data: 'r:unknown:0' });
-  const { relay, calls } = buildRelay({ getUpdates: async () => [update] });
-
-  await relay.pollUpdates();
-
-  assert.deepEqual(calls.answerCallbackQuery, [{ botToken: 'tok', id: 'cbq1', opts: { text: 'This question has expired.' } }]);
-  assert.equal(calls.answerBlockedAgent.length, 0);
-});
-
-test('_handleCallbackQuery ignores malformed callback_data without answering or relaying', async () => {
-  const update = callbackUpdate({ updateId: 1, data: 'not-the-expected-shape' });
-  const { relay, calls } = buildRelay({ getUpdates: async () => [update] });
-
-  await relay.pollUpdates();
-
-  assert.equal(calls.answerCallbackQuery.length, 0);
-  assert.equal(calls.answerBlockedAgent.length, 0);
-});
-
-test('_handleCallbackQuery reports failure back to the chat when answerBlockedAgent throws, and still expires the pane', async () => {
-  const stateStore = buildStateStore({
-    resolveByToken: (token) => (token === 'abc123' ? { paneId: 'p1', options: [{ label: 'Yes', value: 'y' }] } : null),
-  });
-  const update = callbackUpdate({ updateId: 1, data: 'r:abc123:0' });
-  const { relay, calls, stateStore: store } = buildRelay({
-    stateStore,
-    getUpdates: async () => [update],
-    answerBlockedAgent: async () => {
-      throw new Error('herdr pane send-text failed');
+    registerMessage: (providerId, messageId, paneId) => {
+      state.messages[`${providerId}:${messageId}`] = paneId;
     },
-  });
-
-  await relay.pollUpdates();
-
-  assert.equal(calls.sendMessage.length, 1);
-  assert.match(calls.sendMessage[0].text, /Failed to relay your answer/);
-  assert.deepEqual(store.calls.expirePane, ['p1']);
-});
-
-test('_handleMessage reports failure back to the chat when answerBlockedAgent throws, and still expires the pane', async () => {
-  const stateStore = buildStateStore({ getBlockedPanes: () => ['p3'] });
-  const update = messageUpdate({ updateId: 1, text: 'my answer' });
-  const { relay, calls, stateStore: store } = buildRelay({
-    stateStore,
-    getUpdates: async () => [update],
-    answerBlockedAgent: async () => {
-      throw new Error('herdr pane send-text failed');
+    setAwaitingText: (paneId) => {
+      state.awaitingText[paneId] = true;
     },
+    isAwaitingText: (paneId) => state.awaitingText[paneId] === true,
+    resolveByMessageId: (providerId, messageId) => state.messages[`${providerId}:${messageId}`] || null,
+    resolveByToken: (token) => state.tokens[token] || null,
+    resolveOptionsByPane: (paneId) => {
+      const entry = Object.values(state.tokens).find((candidate) => candidate.paneId === paneId);
+      return entry ? entry.options : null;
+    },
+    getBlockedPanes: () => [...state.blockedPanes],
+    getQuestion: (paneId) => state.questions[paneId] || null,
+    getDeliveries: (paneId) => state.deliveries[paneId] || [],
+    expirePane: (paneId) => {
+      state.blockedPanes = state.blockedPanes.filter((pane) => pane !== paneId);
+      delete state.deliveries[paneId];
+      delete state.questions[paneId];
+      delete state.awaitingText[paneId];
+      for (const [key, mapped] of Object.entries(state.messages)) {
+        if (mapped === paneId) {
+          delete state.messages[key];
+        }
+      }
+      for (const [token, entry] of Object.entries(state.tokens)) {
+        if (entry.paneId === paneId) {
+          delete state.tokens[token];
+        }
+      }
+    },
+  };
+  return store;
+}
+
+function build({
+  providers = [],
+  options = MENU_OPTIONS,
+  context = 'waiting for input',
+  answerFails = null,
+  config = relayConfig(),
+  store = fakeStore(),
+} = {}) {
+  const logs = [];
+  const answers = [];
+  // Arrays let a test make the pane's *second* read (after an answer) differ
+  // from the first, which is what a multi-question prompt does.
+  const contexts = Array.isArray(context) ? [...context] : [context];
+  const optionSets = Array.isArray(options) && Array.isArray(options[0]) ? [...options] : [options];
+  const nextOf = (queue) => (queue.length > 1 ? queue.shift() : queue[0]);
+
+  const relay = new Relay({
+    loadConfig: () => config,
+    createProviders: () => ({ providers, unconfigured: [] }),
+    readAgentOutput: async () => nextOf(contexts),
+    answerBlockedAgent: async (paneId, text) => {
+      if (answerFails) {
+        throw new Error(answerFails);
+      }
+      answers.push({ paneId, text });
+    },
+    detectOptions: () => nextOf(optionSets),
+    stateStore: store,
+    log: (line) => logs.push(line),
+    settle: async () => {},
   });
+  return { relay, logs, answers, store };
+}
+
+test('a blocked event is delivered to every enabled provider with the same token', async () => {
+  const telegram = fakeProvider('telegram');
+  const discord = fakeProvider('discord');
+  const slack = fakeProvider('slack');
+  const { relay } = build({ providers: [telegram, discord, slack] });
+
+  const failures = await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram, discord, slack]);
+
+  assert.deepEqual(failures, []);
+  assert.equal(telegram.blocked.length, 1);
+  assert.equal(discord.blocked.length, 1);
+  assert.equal(slack.blocked.length, 1);
+  assert.equal(telegram.blocked[0].token, discord.blocked[0].token);
+  assert.equal(telegram.blocked[0].context, 'waiting for input');
+  assert.deepEqual(telegram.blocked[0].options, MENU_OPTIONS);
+});
+
+test('every provider message id is tracked so an answer can arrive on any of them', async () => {
+  const telegram = fakeProvider('telegram');
+  const slack = fakeProvider('slack');
+  const { relay, store } = build({ providers: [telegram, slack] });
+
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram, slack]);
+
+  assert.deepEqual(store.getBlockedPanes(), ['pane-1']);
+  assert.equal(store.resolveByMessageId('telegram', 'telegram-msg-1'), 'pane-1');
+  assert.equal(store.resolveByMessageId('slack', 'slack-msg-1'), 'pane-1');
+  assert.equal(store.getDeliveries('pane-1').length, 2);
+});
+
+test('no token is generated when the pane has no detected options', async () => {
+  const telegram = fakeProvider('telegram');
+  const { relay } = build({ providers: [telegram], options: [] });
+
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram]);
+
+  assert.equal(telegram.blocked[0].token, undefined);
+});
+
+test('one failing provider is reported while the others still deliver and get tracked', async () => {
+  const telegram = fakeProvider('telegram');
+  const slack = fakeProvider('slack', { failSendBlocked: 'slack chat.postMessage failed: channel_not_found' });
+  const { relay, store } = build({ providers: [telegram, slack] });
+
+  const failures = await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram, slack]);
+
+  assert.deepEqual(failures, [
+    { providerId: 'slack', message: 'slack chat.postMessage failed: channel_not_found' },
+  ]);
+  assert.deepEqual(store.getBlockedPanes(), ['pane-1']);
+  assert.equal(store.getDeliveries('pane-1').length, 1);
+});
+
+test('a pane no provider could be told about is left untracked', async () => {
+  const telegram = fakeProvider('telegram', { failSendBlocked: 'boom' });
+  const { relay, store } = build({ providers: [telegram] });
+
+  const failures = await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram]);
+
+  assert.equal(failures.length, 1);
+  assert.deepEqual(store.getBlockedPanes(), []);
+});
+
+test('pollUpdates does nothing while the relay is disabled', async () => {
+  const telegram = fakeProvider('telegram');
+  const { relay } = build({ providers: [telegram], config: relayConfig({ relay: { enabled: false } }) });
 
   await relay.pollUpdates();
 
-  assert.equal(calls.sendMessage.length, 1);
-  assert.match(calls.sendMessage[0].text, /Failed to relay your answer/);
-  assert.deepEqual(store.calls.expirePane, ['p3']);
+  assert.deepEqual(telegram.fetched, []);
 });
 
-test('pollUpdates resolves a free-text reply that matches a detected option label to that option\'s value', async () => {
-  const stateStore = buildStateStore({
-    getBlockedPanes: () => ['p1'],
-    resolveOptionsByPane: (paneId) => (paneId === 'p1' ? [{ label: '1. Yes, I trust this folder', value: '1' }, { label: '2. No, exit', value: '2' }] : null),
-  });
-  const update = messageUpdate({ updateId: 1, text: 'no, exit' });
-  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
+test('pollUpdates polls every enabled provider and stores each cursor separately', async () => {
+  const telegram = fakeProvider('telegram', { inbound: [{ events: [], cursor: 120 }] });
+  const slack = fakeProvider('slack', { inbound: [{ events: [], cursor: '1.5' }] });
+  const { relay, store } = build({ providers: [telegram, slack] });
 
   await relay.pollUpdates();
 
-  assert.deepEqual(calls.answerBlockedAgent, [{ paneId: 'p1', text: '2' }]);
+  assert.deepEqual(telegram.fetched, [undefined]);
+  assert.equal(store.getCursor('telegram', 'target-telegram'), 120);
+  assert.equal(store.getCursor('slack', 'target-slack'), '1.5');
 });
 
-test('pollUpdates relays free text unchanged when it matches no detected option', async () => {
-  const stateStore = buildStateStore({
-    getBlockedPanes: () => ['p1'],
-    resolveOptionsByPane: (paneId) => (paneId === 'p1' ? [{ label: '1. Yes', value: '1' }, { label: '2. No', value: '2' }] : null),
-  });
-  const update = messageUpdate({ updateId: 1, text: 'actually, do something else entirely' });
-  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
+test('one provider failing to poll does not stop the others', async () => {
+  const telegram = {
+    ...fakeProvider('telegram'),
+    async fetchInbound() {
+      throw new Error('network down');
+    },
+  };
+  const slack = fakeProvider('slack', { inbound: [{ events: [], cursor: '1.5' }] });
+  const { relay, logs, store } = build({ providers: [telegram, slack] });
 
   await relay.pollUpdates();
 
-  assert.deepEqual(calls.answerBlockedAgent, [{ paneId: 'p1', text: 'actually, do something else entirely' }]);
+  assert.ok(logs.some((line) => line.includes('telegram relay poll failed: network down')));
+  assert.equal(store.getCursor('slack', 'target-slack'), '1.5');
 });
 
-test('pollUpdates relays free text unchanged when the blocked pane has no detected options', async () => {
-  const stateStore = buildStateStore({
-    getBlockedPanes: () => ['p1'],
-    resolveOptionsByPane: () => null,
+test('a button press answers the pane with the selected option value', async () => {
+  const telegram = fakeProvider('telegram');
+  const { relay, store, answers } = build({ providers: [telegram] });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram]);
+  const token = telegram.blocked[0].token;
+
+  telegram.fetchInbound = async () => ({
+    events: [{ kind: 'action', id: '1', actionId: 'cb-1', data: `r:${token}:1`, messageId: 'telegram-msg-1' }],
+    cursor: 5,
   });
-  const update = messageUpdate({ updateId: 1, text: 'y' });
-  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
+  await relay.pollUpdates();
+
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: '2' }]);
+  assert.deepEqual(telegram.acknowledged, [{ actionId: 'cb-1', text: 'Sent.' }]);
+  assert.deepEqual(store.getBlockedPanes(), []);
+});
+
+test('an answered question is marked answered on every provider that received it', async () => {
+  const telegram = fakeProvider('telegram');
+  const discord = fakeProvider('discord');
+  const store = fakeStore();
+  const { relay } = build({ providers: [telegram, discord], store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram, discord]);
+  const token = telegram.blocked[0].token;
+
+  telegram.fetchInbound = async () => ({
+    events: [{ kind: 'action', id: '1', actionId: 'cb-1', data: `r:${token}:0`, messageId: 'telegram-msg-1' }],
+    cursor: 5,
+  });
+  discord.fetchInbound = async () => ({ events: [], cursor: '1' });
+  await relay.pollUpdates();
+
+  assert.deepEqual(telegram.answered, [
+    { messageId: 'telegram-msg-1', baseText: 'telegram base', selectedLabel: '1. Yes, proceed' },
+  ]);
+  assert.deepEqual(discord.answered, [
+    { messageId: 'discord-msg-1', baseText: 'discord base', selectedLabel: '1. Yes, proceed' },
+  ]);
+});
+
+test('a failure to edit the answered message is logged, not surfaced as a relay failure', async () => {
+  const telegram = fakeProvider('telegram', { failMarkAnswered: true });
+  const store = fakeStore();
+  const { relay, logs, answers } = build({ providers: [telegram], store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram]);
+  const token = telegram.blocked[0].token;
+
+  telegram.fetchInbound = async () => ({
+    events: [{ kind: 'action', id: '1', actionId: 'cb-1', data: `r:${token}:0`, messageId: 'telegram-msg-1' }],
+    cursor: 5,
+  });
+  await relay.pollUpdates();
+
+  assert.equal(answers.length, 1);
+  assert.ok(logs.some((line) => line.includes('failed to update the answered message: too old to edit')));
+  assert.deepEqual(telegram.texts, [], 'the user is not told the relay failed');
+});
+
+test('a button press for an expired token is acknowledged as expired and answers nothing', async () => {
+  const telegram = fakeProvider('telegram', {
+    inbound: [{ events: [{ kind: 'action', id: '1', actionId: 'cb-1', data: 'r:gone:0' }], cursor: 5 }],
+  });
+  const { relay, answers } = build({ providers: [telegram] });
 
   await relay.pollUpdates();
 
-  assert.deepEqual(calls.answerBlockedAgent, [{ paneId: 'p1', text: 'y' }]);
+  assert.deepEqual(answers, []);
+  assert.deepEqual(telegram.acknowledged, [{ actionId: 'cb-1', text: 'This question has expired.' }]);
 });
 
-test('notifyBlocked sends a text-only message and tracks it when no options are detected', async () => {
-  const { relay, calls, stateStore } = buildRelay({
-    readAgentOutput: async () => 'plain agent output with no menu',
-    detectOptions: () => [],
+test('callback data that is not ours is ignored entirely', async () => {
+  const telegram = fakeProvider('telegram', {
+    inbound: [{ events: [{ kind: 'action', id: '1', actionId: 'cb-1', data: 'other:plugin:0' }], cursor: 5 }],
   });
-
-  await relay.notifyBlocked({ paneId: 'p1', agent: {} }, CONFIG);
-
-  assert.equal(calls.sendMessage.length, 1);
-  assert.equal(calls.sendMessage[0].replyMarkup, undefined);
-  assert.equal(stateStore.calls.trackBlocked.length, 1);
-  const { args } = stateStore.calls.trackBlocked[0];
-  assert.equal(stateStore.calls.trackBlocked[0].paneId, 'p1');
-  assert.equal(args.messageId, 999);
-  assert.equal(args.token, undefined);
-  assert.deepEqual(args.options, []);
-});
-
-test('notifyBlocked builds an inline keyboard and tracks the token when options are detected', async () => {
-  const options = [
-    { label: '1. Yes', value: 'Yes' },
-    { label: '2. No', value: 'No' },
-  ];
-  const { relay, calls, stateStore } = buildRelay({
-    readAgentOutput: async () => '1. Yes\n2. No',
-    detectOptions: () => options,
-  });
-
-  await relay.notifyBlocked({ paneId: 'p1', agent: {} }, CONFIG);
-
-  assert.equal(calls.sendMessage.length, 1);
-  const { replyMarkup, text } = calls.sendMessage[0];
-  assert.equal(replyMarkup.inline_keyboard.length, 1);
-  assert.equal(replyMarkup.inline_keyboard[0].length, 2);
-  assert.equal(replyMarkup.inline_keyboard[0][0].text, '1. Yes');
-  assert.match(replyMarkup.inline_keyboard[0][0].callback_data, /^r:[0-9a-f]{8}:0$/);
-  assert.match(text, /reply with your own answer/);
-  assert.equal(stateStore.calls.trackBlocked.length, 1);
-  assert.equal(stateStore.calls.trackBlocked[0].paneId, 'p1');
-  assert.deepEqual(stateStore.calls.trackBlocked[0].args.options, options);
-});
-
-test('notifyBlocked HTML-escapes agent output before embedding it in the message', async () => {
-  const { relay, calls } = buildRelay({
-    readAgentOutput: async () => 'Run <script>alert(1)</script> & continue?',
-    detectOptions: () => [],
-  });
-
-  await relay.notifyBlocked({ paneId: 'p1', agent: {} }, CONFIG);
-
-  const { text } = calls.sendMessage[0];
-  assert.doesNotMatch(text, /<script>/);
-  assert.match(text, /&lt;script&gt;/);
-  assert.match(text, /&amp;/);
-});
-
-test('notifyBlocked marks expectsText option buttons with a pencil suffix', async () => {
-  const options = [
-    { label: '1. Yes', value: '1' },
-    { label: '2. Type something.', value: '2', expectsText: true },
-  ];
-  const { relay, calls } = buildRelay({
-    readAgentOutput: async () => '1. Yes\n2. Type something.',
-    detectOptions: () => options,
-  });
-
-  await relay.notifyBlocked({ paneId: 'p1', agent: {} }, CONFIG);
-
-  const { replyMarkup } = calls.sendMessage[0];
-  assert.equal(replyMarkup.inline_keyboard[0][0].text, '1. Yes');
-  assert.equal(replyMarkup.inline_keyboard[0][1].text, '2. Type something. ✏️');
-});
-
-test('tapping an expectsText option sends the digit, keeps the pane awaiting text, and prompts for the follow-up reply', async () => {
-  const stateStore = buildStateStore({
-    resolveByToken: (token) =>
-      (token === 'abc123'
-        ? { paneId: 'p1', options: [{ label: '3. Type something.', value: '3', expectsText: true }], text: 'body' }
-        : null),
-  });
-  const update = callbackUpdate({ updateId: 1, data: 'r:abc123:0' });
-  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
+  const { relay, answers } = build({ providers: [telegram] });
 
   await relay.pollUpdates();
 
-  assert.deepEqual(calls.answerBlockedAgent, [{ paneId: 'p1', text: '3' }]);
-  assert.deepEqual(stateStore.calls.setAwaitingText, ['p1']);
-  assert.deepEqual(stateStore.calls.expirePane, []);
-  assert.equal(calls.sendMessage.length, 1);
-  const prompt = calls.sendMessage[0];
-  assert.match(prompt.text, /reply with the text/i);
-  assert.deepEqual(prompt.replyMarkup, { force_reply: true });
-  assert.deepEqual(stateStore.calls.registerMessage, [{ messageId: 999, paneId: 'p1' }]);
+  assert.deepEqual(answers, []);
+  assert.deepEqual(telegram.acknowledged, []);
 });
 
-test('a reply to a pane awaiting text is relayed verbatim (no option matching) and expires the pane', async () => {
-  const stateStore = buildStateStore({
-    resolveByMessageId: (messageId) => (messageId === 5 ? 'p1' : null),
-    isAwaitingText: (paneId) => paneId === 'p1',
-    // A stale option whose value matches the reply — must NOT be applied.
-    resolveOptionsByPane: () => [{ label: '1. Yes', value: '1' }],
+test('a reply on Discord answers the pane the Discord message belongs to', async () => {
+  const discord = fakeProvider('discord');
+  const store = fakeStore();
+  const { relay, answers } = build({ providers: [discord], store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [discord]);
+
+  discord.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '400', text: '2', replyToMessageId: 'discord-msg-1' }],
+    cursor: '400',
   });
-  const update = messageUpdate({ updateId: 1, text: '1', replyToMessageId: 5 });
-  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
+  await relay.pollUpdates();
+
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: '2' }]);
+});
+
+test('a reply matching an option label is sent as the option value the widget expects', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const { relay, answers } = build({ providers: [slack], store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+
+  slack.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '1.2', text: 'no', replyToMessageId: 'slack-msg-1' }],
+    cursor: '1.2',
+  });
+  await relay.pollUpdates();
+
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: '2' }]);
+});
+
+test('free text that matches no option is relayed verbatim', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const { relay, answers } = build({ providers: [slack], store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+
+  slack.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '1.2', text: 'use the other branch', replyToMessageId: 'slack-msg-1' }],
+    cursor: '1.2',
+  });
+  await relay.pollUpdates();
+
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: 'use the other branch' }]);
+});
+
+test('a bare reply is accepted when exactly one pane is blocked', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const { relay, answers } = build({ providers: [slack], store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+
+  slack.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '1.2', text: '1', replyToMessageId: null }],
+    cursor: '1.2',
+  });
+  await relay.pollUpdates();
+
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: '1' }]);
+});
+
+test('a bare reply with several panes blocked asks the user to reply to a specific one', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const { relay, answers } = build({ providers: [slack], store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+  await relay.notifyBlocked({ ...BLOCKED_EVENT, paneId: 'pane-2' }, relayConfig(), [slack]);
+
+  slack.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '1.9', text: '1', replyToMessageId: null }],
+    cursor: '1.9',
+  });
+  await relay.pollUpdates();
+
+  assert.deepEqual(answers, []);
+  assert.ok(slack.texts.some((text) => text.includes('reply directly to the specific blocked-agent notification')));
+});
+
+test('selecting a free-text option keeps the pane open and asks for the text', async () => {
+  const telegram = fakeProvider('telegram');
+  const store = fakeStore();
+  const freeTextOptions = [{ label: '1. Type something', value: '1', expectsText: true }];
+  const { relay, answers } = build({ providers: [telegram], options: freeTextOptions, store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram]);
+  const token = telegram.blocked[0].token;
+
+  telegram.fetchInbound = async () => ({
+    events: [{ kind: 'action', id: '1', actionId: 'cb-1', data: `r:${token}:0`, messageId: 'telegram-msg-1' }],
+    cursor: 5,
+  });
+  await relay.pollUpdates();
+
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: '1' }]);
+  assert.equal(store.isAwaitingText('pane-1'), true);
+  assert.deepEqual(store.getBlockedPanes(), ['pane-1']);
+  assert.ok(telegram.prompts[0].includes('now reply with the text to send'));
+  assert.equal(store.resolveByMessageId('telegram', 'telegram-prompt-1'), 'pane-1');
+});
+
+test('the follow-up text is relayed verbatim and closes the exchange', async () => {
+  const telegram = fakeProvider('telegram');
+  const store = fakeStore();
+  store.trackBlocked('pane-1', {
+    deliveries: [{ providerId: 'telegram', messageId: 'telegram-msg-1', baseText: 'base' }],
+  });
+  store.setAwaitingText('pane-1');
+  const { relay, answers } = build({ providers: [telegram], store });
+
+  telegram.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '2', text: '2', replyToMessageId: 'telegram-msg-1' }],
+    cursor: 6,
+  });
+  await relay.pollUpdates();
+
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: '2' }], 'a digit is not re-matched against the old menu');
+  assert.deepEqual(store.getBlockedPanes(), []);
+});
+
+test('a failure to type the answer into the pane is reported back in the same chat', async () => {
+  const discord = fakeProvider('discord');
+  const store = fakeStore();
+  const { relay } = build({ providers: [discord], store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [discord]);
+
+  const { relay: failingRelay } = build({
+    providers: [discord],
+    store,
+    answerFails: 'pane pane-1 is gone',
+  });
+  discord.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '401', text: '1', replyToMessageId: 'discord-msg-1' }],
+    cursor: '401',
+  });
+  await failingRelay.pollUpdates();
+
+  assert.ok(discord.texts.some((text) => text.includes('Failed to relay your answer: pane pane-1 is gone')));
+  assert.deepEqual(store.getBlockedPanes(), []);
+});
+
+test('a cursor advances even when the event it carried could not be processed', async () => {
+  const telegram = fakeProvider('telegram');
+  const store = fakeStore();
+  const { relay } = build({ providers: [telegram], store });
+  telegram.fetchInbound = async () => ({
+    events: [{ kind: 'action', id: '1', actionId: 'cb-1', data: 'r:tok:0' }],
+    cursor: 77,
+  });
+  telegram.acknowledgeAction = async () => {
+    throw new Error('query is too old');
+  };
 
   await relay.pollUpdates();
 
-  assert.deepEqual(calls.answerBlockedAgent, [{ paneId: 'p1', text: '1' }]);
-  assert.deepEqual(stateStore.calls.expirePane, ['p1']);
+  assert.equal(store.getCursor('telegram', 'target-telegram'), 77, 'a stuck event must not stall the relay forever');
 });
 
-test('a free-text reply matching an expectsText option follows the same two-step path as a button tap', async () => {
-  const stateStore = buildStateStore({
-    getBlockedPanes: () => ['p1'],
-    resolveOptionsByPane: () => [
-      { label: '1. Yes', value: '1' },
-      { label: '4. Chat about this', value: '4', expectsText: true },
+test('several inbound answers in one batch are all processed', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const { relay, answers } = build({ providers: [slack], store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+  await relay.notifyBlocked({ ...BLOCKED_EVENT, paneId: 'pane-2' }, relayConfig(), [slack]);
+
+  slack.fetchInbound = async () => ({
+    events: [
+      { kind: 'text', id: '1.3', text: '1', replyToMessageId: 'slack-msg-1' },
+      { kind: 'text', id: '1.4', text: '2', replyToMessageId: 'slack-msg-2' },
     ],
+    cursor: '1.4',
   });
-  const update = messageUpdate({ updateId: 1, text: 'chat about this' });
-  const { relay, calls } = buildRelay({ stateStore, getUpdates: async () => [update] });
+  await relay.pollUpdates();
+
+  assert.deepEqual(answers, [
+    { paneId: 'pane-1', text: '1' },
+    { paneId: 'pane-2', text: '2' },
+  ]);
+});
+
+test('the inbound cursor is scoped to the channel the provider points at', async () => {
+  const slack = fakeProvider('slack', { inbound: [{ events: [], cursor: '200.1' }] });
+  slack.targetId = 'C_NEW';
+  const store = fakeStore();
+  // A cursor left behind by the same provider pointed at a different channel.
+  store.setCursor('slack', '100.5', 'C_OLD');
+  const { relay } = build({ providers: [slack], store });
 
   await relay.pollUpdates();
 
-  assert.deepEqual(calls.answerBlockedAgent, [{ paneId: 'p1', text: '4' }]);
-  assert.deepEqual(stateStore.calls.setAwaitingText, ['p1']);
-  assert.deepEqual(stateStore.calls.expirePane, []);
-  assert.equal(calls.sendMessage.length, 1);
-  assert.match(calls.sendMessage[0].text, /reply with the text/i);
+  assert.deepEqual(slack.fetched, [undefined], 'a foreign channel cursor must not be replayed as oldest=');
+  assert.equal(store.getCursor('slack', 'C_NEW'), '200.1');
+});
+
+test('the cursor is reused when the provider still points at the same channel', async () => {
+  const slack = fakeProvider('slack', { inbound: [{ events: [], cursor: '100.9' }] });
+  slack.targetId = 'C_SAME';
+  const store = fakeStore();
+  store.setCursor('slack', '100.5', 'C_SAME');
+  const { relay } = build({ providers: [slack], store });
+
+  await relay.pollUpdates();
+
+  assert.deepEqual(slack.fetched, ['100.5']);
+});
+
+// --- multi-question prompts: answering one advances the pane to the next ---
+
+const SECOND_QUESTION = [
+  { label: '1. Inline link', value: '1' },
+  { label: '2. Attach the file', value: '2' },
+];
+
+test('the next question of a multi-question prompt is announced after an answer', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const { relay, answers } = build({
+    providers: [slack],
+    options: [MENU_OPTIONS, SECOND_QUESTION],
+    context: ['Report layout?', 'Report link?'],
+    store,
+  });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+
+  slack.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '1.2', text: '1', replyToMessageId: 'slack-msg-1' }],
+    cursor: '1.2',
+  });
+  await relay.pollUpdates();
+
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: '1' }]);
+  assert.equal(slack.blocked.length, 2, 'the second question is sent as its own blocked message');
+  assert.deepEqual(slack.blocked[1].options, SECOND_QUESTION);
+  assert.equal(slack.blocked[1].context, 'Report link?');
+});
+
+test('the pane stays tracked so the next question can be answered too', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const { relay } = build({
+    providers: [slack],
+    options: [MENU_OPTIONS, SECOND_QUESTION],
+    context: ['Report layout?', 'Report link?'],
+    store,
+  });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+
+  slack.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '1.2', text: '1', replyToMessageId: 'slack-msg-1' }],
+    cursor: '1.2',
+  });
+  await relay.pollUpdates();
+
+  assert.deepEqual(store.getBlockedPanes(), ['pane-1']);
+  assert.equal(store.resolveByMessageId('slack', 'slack-msg-2'), 'pane-1', 'the new message routes to the pane');
+  assert.deepEqual(store.resolveOptionsByPane('pane-1'), SECOND_QUESTION);
+});
+
+test('the follow-up reuses the agent label from the original event', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const { relay } = build({
+    providers: [slack],
+    options: [MENU_OPTIONS, SECOND_QUESTION],
+    context: ['Report layout?', 'Report link?'],
+    store,
+  });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+
+  slack.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '1.2', text: '1', replyToMessageId: 'slack-msg-1' }],
+    cursor: '1.2',
+  });
+  await relay.pollUpdates();
+
+  assert.deepEqual(slack.blocked[1].event, BLOCKED_EVENT);
+});
+
+test('an answered prompt with no menu left expires the pane', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const { relay } = build({
+    providers: [slack],
+    options: [MENU_OPTIONS, []],
+    context: ['Report layout?', 'all done'],
+    store,
+  });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+
+  slack.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '1.2', text: '1', replyToMessageId: 'slack-msg-1' }],
+    cursor: '1.2',
+  });
+  await relay.pollUpdates();
+
+  assert.deepEqual(store.getBlockedPanes(), []);
+  assert.equal(slack.blocked.length, 1);
+});
+
+test('an unchanged menu is not re-announced, so a slow redraw cannot loop', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const { relay } = build({ providers: [slack], options: MENU_OPTIONS, store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+
+  slack.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '1.2', text: '1', replyToMessageId: 'slack-msg-1' }],
+    cursor: '1.2',
+  });
+  await relay.pollUpdates();
+
+  assert.equal(slack.blocked.length, 1, 'the same question must not be sent again');
+  assert.deepEqual(store.getBlockedPanes(), []);
+});
+
+test('a menu whose values changed is treated as a new question', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const relabelled = [
+    { label: '1. Yes, proceed', value: '1' },
+    { label: '2. No', value: '2' },
+    { label: '3. Ask me later', value: '3' },
+  ];
+  const { relay } = build({
+    providers: [slack],
+    options: [MENU_OPTIONS, relabelled],
+    context: ['first', 'second'],
+    store,
+  });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+
+  slack.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '1.2', text: '1', replyToMessageId: 'slack-msg-1' }],
+    cursor: '1.2',
+  });
+  await relay.pollUpdates();
+
+  assert.equal(slack.blocked.length, 2);
+});
+
+test('a free-text option still asks for the follow-up text instead of the next question', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const freeText = [{ label: '1. Type something', value: '1', expectsText: true }];
+  const { relay } = build({
+    providers: [slack],
+    options: [freeText, SECOND_QUESTION],
+    context: ['q1', 'q2'],
+    store,
+  });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+
+  slack.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '1.2', text: '1', replyToMessageId: 'slack-msg-1' }],
+    cursor: '1.2',
+  });
+  await relay.pollUpdates();
+
+  assert.equal(slack.prompts.length, 1, 'the text prompt takes priority over a next-question scan');
+  assert.equal(slack.blocked.length, 1);
+  assert.equal(store.isAwaitingText('pane-1'), true);
+});
+
+test('a failed re-read expires the pane rather than leaving it half-tracked', async () => {
+  const slack = fakeProvider('slack');
+  const store = fakeStore();
+  const { relay, logs } = build({ providers: [slack], store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [slack]);
+
+  relay._readAgentOutput = async () => {
+    throw new Error('pane is gone');
+  };
+  slack.fetchInbound = async () => ({
+    events: [{ kind: 'text', id: '1.2', text: '1', replyToMessageId: 'slack-msg-1' }],
+    cursor: '1.2',
+  });
+  await relay.pollUpdates();
+
+  assert.deepEqual(store.getBlockedPanes(), []);
+  assert.ok(logs.some((line) => line.includes('could not re-read pane-1 after answering: pane is gone')));
+});
+
+test('a button tap also advances to the next question', async () => {
+  const telegram = fakeProvider('telegram');
+  const store = fakeStore();
+  const { relay } = build({
+    providers: [telegram],
+    options: [MENU_OPTIONS, SECOND_QUESTION],
+    context: ['q1', 'q2'],
+    store,
+  });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram]);
+  const token = telegram.blocked[0].token;
+
+  telegram.fetchInbound = async () => ({
+    events: [{ kind: 'action', id: '1', actionId: 'cb-1', data: `r:${token}:0`, messageId: 'telegram-msg-1' }],
+    cursor: 5,
+  });
+  await relay.pollUpdates();
+
+  assert.equal(telegram.blocked.length, 2);
+  assert.deepEqual(telegram.blocked[1].options, SECOND_QUESTION);
+});
+
+test('the next question gets its own token so the old buttons cannot answer it', async () => {
+  const telegram = fakeProvider('telegram');
+  const store = fakeStore();
+  const { relay } = build({
+    providers: [telegram],
+    options: [MENU_OPTIONS, SECOND_QUESTION],
+    context: ['q1', 'q2'],
+    store,
+  });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram]);
+  const firstToken = telegram.blocked[0].token;
+
+  telegram.fetchInbound = async () => ({
+    events: [{ kind: 'action', id: '1', actionId: 'cb-1', data: `r:${firstToken}:0`, messageId: 'telegram-msg-1' }],
+    cursor: 5,
+  });
+  await relay.pollUpdates();
+
+  assert.notEqual(telegram.blocked[1].token, firstToken);
+  assert.equal(store.resolveByToken(firstToken), null, 'the answered question is no longer routable');
 });

@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { detectOptions, MAX_DETECTED_OPTIONS } = require('../lib/option-detector.js');
+const { detectOptions, stripAdjacentColumn, MAX_DETECTED_OPTIONS } = require('../lib/option-detector.js');
 
 test('contiguous numbered list in realistic pane output returns options in order', () => {
   const text = [
@@ -133,4 +133,75 @@ test('more than MAX_DETECTED_OPTIONS numbered lines are capped', () => {
     label: `${index + 1}. Option ${index + 1}`,
     value: `${index + 1}`,
   })));
+});
+
+// --- side-by-side preview column (Claude Code's AskUserQuestion) ---
+
+// Reconstructed from a real prompt: the option list and a preview panel share
+// terminal rows, so every option line also carries the panel's box art.
+const TWO_COLUMN_PROMPT = [
+  '← □ Report layout  □ Report link  ✓ Submit  →',
+  '',
+  'How should the daily/trend reports be laid out in Slack?',
+  '',
+  '❯ 1. Sectioned + link button      ┌─────────────────────────────────────────┐',
+  '     (Recommended)                │ 📊 24h error summary — 8 Sept            │',
+  '  2. Compact with fields          │ │ stg-eu · prod-eu · 3 clean  │  ← muted │',
+  '  3. Thread the detail            │ ──────────── divider ─────────────── │',
+  '',
+  'Enter to select · ↑/↓ to navigate · Tab to switch questions · Esc to cancel',
+].join('\n');
+
+test('an adjacent preview column is not captured into the option label', () => {
+  const options = detectOptions(TWO_COLUMN_PROMPT);
+
+  assert.deepEqual(
+    options.map((option) => option.label),
+    ['1. Sectioned + link button', '2. Compact with fields', '3. Thread the detail'],
+  );
+});
+
+test('labels from a two-column prompt stay short enough for a chat button', () => {
+  for (const option of detectOptions(TWO_COLUMN_PROMPT)) {
+    assert.ok(option.label.length <= 40, `label too long for a button: ${JSON.stringify(option.label)}`);
+  }
+});
+
+test('the option values are unaffected by column stripping', () => {
+  assert.deepEqual(
+    detectOptions(TWO_COLUMN_PROMPT).map((option) => option.value),
+    ['1', '2', '3'],
+  );
+});
+
+test('stripAdjacentColumn cuts at a gutter before box-drawing art', () => {
+  assert.equal(stripAdjacentColumn('Sectioned + link button      ┌────────┐'), 'Sectioned + link button');
+  assert.equal(stripAdjacentColumn('Compact with fields  │ preview │'), 'Compact with fields');
+});
+
+test('stripAdjacentColumn cuts at any three-space gutter', () => {
+  assert.equal(stripAdjacentColumn('Thread the detail   Notes: press n to add notes'), 'Thread the detail');
+});
+
+test('stripAdjacentColumn leaves a normal label alone', () => {
+  assert.equal(stripAdjacentColumn('Yes, proceed'), 'Yes, proceed');
+  assert.equal(stripAdjacentColumn('No, and tell Claude what to do differently'), 'No, and tell Claude what to do differently');
+});
+
+test('stripAdjacentColumn keeps single- and double-spaced label text', () => {
+  assert.equal(stripAdjacentColumn('Use the other branch'), 'Use the other branch');
+  assert.equal(stripAdjacentColumn('Yes  really'), 'Yes  really', 'two spaces alone is not a gutter');
+});
+
+test('a free-text option in a two-column prompt is still recognised', () => {
+  const prompt = [
+    'What should I do?',
+    '  1. Proceed              ┌──────────┐',
+    '  2. Type something       │ preview  │',
+  ].join('\n');
+
+  const options = detectOptions(prompt);
+
+  assert.equal(options[1].label, '2. Type something');
+  assert.equal(options[1].expectsText, true, 'the hint must survive the label being trimmed');
 });
