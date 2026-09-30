@@ -20,6 +20,10 @@ let tempParentDir;
 let tempConfigDir;
 let previousConfigDirEnv;
 
+function enabledByStatus(notifyOn) {
+  return Object.fromEntries(Object.entries(notifyOn).map(([status, rule]) => [status, rule.enabled]));
+}
+
 function writeConfigFile(contents, dir = tempConfigDir) {
   const serialized = typeof contents === 'string' ? contents : JSON.stringify(contents);
   fs.mkdirSync(dir, { recursive: true });
@@ -63,12 +67,77 @@ test('every known provider is present and disabled by default', () => {
 test('per-type toggle override is respected', () => {
   writeConfigFile({ notifyOn: { idle: false, blocked: true, done: false } });
   const config = loadConfig();
-  assert.deepEqual(config.notifyOn, { idle: false, blocked: true, done: false });
+  assert.deepEqual(enabledByStatus(config.notifyOn), { idle: false, blocked: true, done: false });
 });
 
 test('partial notifyOn falls back to defaults for missing keys', () => {
   writeConfigFile({ notifyOn: { done: false } });
-  assert.deepEqual(loadConfig().notifyOn, { idle: true, blocked: true, done: false });
+  assert.deepEqual(enabledByStatus(loadConfig().notifyOn), { idle: true, blocked: true, done: false });
+});
+
+test('the legacy boolean shape keeps each status on its built-in duration rule', () => {
+  writeConfigFile({ notifyOn: { idle: true, blocked: true, done: true } });
+  const { notifyOn } = loadConfig();
+  assert.equal(notifyOn.idle.minWorkingMs, 900000);
+  assert.equal(notifyOn.done.minWorkingMs, 900000);
+  assert.equal(notifyOn.blocked.minWorkingMs, 0);
+  assert.equal(notifyOn.blocked.skipWhenFocused, false);
+});
+
+test('a per-status object configures duration and focus independently', () => {
+  writeConfigFile({
+    notifyOn: {
+      idle: { enabled: true, minWorkingMs: 60000, skipWhenFocused: true },
+      done: { enabled: false },
+    },
+  });
+  const { notifyOn } = loadConfig();
+  assert.deepEqual(notifyOn.idle, { enabled: true, minWorkingMs: 60000, skipWhenFocused: true });
+  assert.equal(notifyOn.done.enabled, false);
+  assert.equal(notifyOn.done.minWorkingMs, 900000);
+});
+
+test('the defaults block applies to every status that does not override it', () => {
+  writeConfigFile({ notifyOn: { defaults: { minWorkingMs: 45000, skipWhenFocused: true } } });
+  const { notifyOn } = loadConfig();
+  for (const status of ['idle', 'blocked', 'done']) {
+    assert.equal(notifyOn[status].minWorkingMs, 45000, status);
+    assert.equal(notifyOn[status].skipWhenFocused, true, status);
+  }
+});
+
+test('a per-status value beats the defaults block', () => {
+  writeConfigFile({
+    notifyOn: { defaults: { minWorkingMs: 45000 }, done: { minWorkingMs: 5000 } },
+  });
+  const { notifyOn } = loadConfig();
+  assert.equal(notifyOn.done.minWorkingMs, 5000);
+  assert.equal(notifyOn.idle.minWorkingMs, 45000);
+});
+
+test('the defaults block is not exposed as a status in the normalized config', () => {
+  writeConfigFile({ notifyOn: { defaults: { minWorkingMs: 45000 } } });
+  assert.deepEqual(Object.keys(loadConfig().notifyOn).sort(), ['blocked', 'done', 'idle']);
+});
+
+test('a negative minWorkingMs is clamped to zero', () => {
+  writeConfigFile({ notifyOn: { done: { minWorkingMs: -5000 } } });
+  assert.equal(loadConfig().notifyOn.done.minWorkingMs, 0);
+});
+
+test('unusable notifyOn field values fall back to the built-in rule', () => {
+  writeConfigFile({
+    notifyOn: { idle: { minWorkingMs: 'soon', skipWhenFocused: [] }, blocked: 'nonsense' },
+  });
+  const { notifyOn } = loadConfig();
+  assert.equal(notifyOn.idle.minWorkingMs, 900000);
+  assert.equal(notifyOn.idle.skipWhenFocused, false);
+  assert.equal(notifyOn.blocked.enabled, true);
+});
+
+test('a numeric-string minWorkingMs is accepted', () => {
+  writeConfigFile({ notifyOn: { done: { minWorkingMs: '120000' } } });
+  assert.equal(loadConfig().notifyOn.done.minWorkingMs, 120000);
 });
 
 test('invalid JSON falls back to defaults', () => {
@@ -238,4 +307,57 @@ test('an explicit telegram block fills only the fields it omits from the legacy 
 
   assert.equal(telegram.botToken, 'rotated-token');
   assert.equal(telegram.chatId, '4242');
+});
+
+test('autoApprove defaults to off with empty rule lists', () => {
+  const config = loadConfig();
+
+  assert.deepEqual(config.autoApprove, { enabled: false, notify: true, globs: [], regexes: [] });
+});
+
+test('autoApprove booleans and pattern lists are read from the file', () => {
+  writeConfigFile({
+    autoApprove: { enabled: true, notify: false, globs: ['git status*'], regexes: ['npm (test|run lint)'] },
+  });
+
+  assert.deepEqual(loadConfig().autoApprove, {
+    enabled: true,
+    notify: false,
+    globs: ['git status*'],
+    regexes: ['npm (test|run lint)'],
+  });
+});
+
+test('autoApprove pattern entries are trimmed, and unusable ones dropped', () => {
+  writeConfigFile({ autoApprove: { globs: ['  ls *  ', '', '   ', 42, null], regexes: ['npm test'] } });
+
+  const { autoApprove } = loadConfig();
+
+  assert.deepEqual(autoApprove.globs, ['ls *'], 'only usable strings survive, trimmed');
+  assert.deepEqual(autoApprove.regexes, ['npm test']);
+});
+
+test('a non-array pattern list falls back to empty rather than throwing', () => {
+  writeConfigFile({ autoApprove: { enabled: true, globs: 'git status*', regexes: { a: 1 } } });
+
+  const { autoApprove } = loadConfig();
+
+  assert.deepEqual(autoApprove.globs, []);
+  assert.deepEqual(autoApprove.regexes, []);
+  assert.equal(autoApprove.enabled, true, 'the rest of the block still applies');
+});
+
+test('a non-object autoApprove block falls back to defaults', () => {
+  writeConfigFile({ autoApprove: 'yes please' });
+
+  assert.deepEqual(loadConfig().autoApprove, { enabled: false, notify: true, globs: [], regexes: [] });
+});
+
+test('autoApprove notify defaults to true when only enabled is set', () => {
+  writeConfigFile({ autoApprove: { enabled: true } });
+
+  const { autoApprove } = loadConfig();
+
+  assert.equal(autoApprove.enabled, true);
+  assert.equal(autoApprove.notify, true);
 });

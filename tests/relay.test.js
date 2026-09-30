@@ -774,3 +774,194 @@ test('the next question gets its own token so the old buttons cannot answer it',
   assert.notEqual(telegram.blocked[1].token, firstToken);
   assert.equal(store.resolveByToken(firstToken), null, 'the answered question is no longer routable');
 });
+
+// --- auto-approve -----------------------------------------------------------
+
+const PERMISSION_OPTIONS = [
+  { label: 'Run (once)', value: 'y' },
+  { label: 'Skip & tell the agent what to do instead', value: 'n', expectsText: true },
+];
+const PERMISSION_CONTEXT = [
+  ' $  git status --short in /repo',
+  '',
+  ' Run this command?',
+  '  → Run (once) (y)',
+  '    Skip & tell the agent what to do instead (esc or n)',
+].join('\n');
+
+function autoApproveConfig(autoApprove = {}) {
+  return relayConfig({
+    autoApprove: { enabled: true, notify: true, globs: ['git status*'], regexes: [], ...autoApprove },
+  });
+}
+
+test('a matching permission prompt is answered in the pane instead of announced', async () => {
+  const telegram = fakeProvider('telegram');
+  const { relay, answers, store } = build({
+    providers: [telegram],
+    options: PERMISSION_OPTIONS,
+    context: PERMISSION_CONTEXT,
+    config: autoApproveConfig(),
+  });
+
+  const failures = await relay.notifyBlocked(BLOCKED_EVENT, autoApproveConfig(), [telegram]);
+
+  assert.deepEqual(failures, []);
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: 'y' }], 'the affirmative key reaches the pane');
+  assert.equal(telegram.blocked.length, 0, 'no question is posted for an auto-approved prompt');
+  assert.deepEqual(store.getBlockedPanes(), [], 'nothing is left tracked — there is no question to answer');
+});
+
+test('the auto-approval notice names the command, the rule, and what was sent', async () => {
+  const telegram = fakeProvider('telegram');
+  const { relay } = build({
+    providers: [telegram],
+    options: PERMISSION_OPTIONS,
+    context: PERMISSION_CONTEXT,
+    config: autoApproveConfig(),
+  });
+
+  await relay.notifyBlocked(BLOCKED_EVENT, autoApproveConfig(), [telegram]);
+
+  assert.equal(telegram.texts.length, 1);
+  assert.match(telegram.texts[0], /git status --short/);
+  assert.match(telegram.texts[0], /glob "git status\*"/);
+  assert.match(telegram.texts[0], /Run \(once\)/);
+});
+
+test('notify:false auto-approves silently', async () => {
+  const telegram = fakeProvider('telegram');
+  const config = autoApproveConfig({ notify: false });
+  const { relay, answers } = build({
+    providers: [telegram],
+    options: PERMISSION_OPTIONS,
+    context: PERMISSION_CONTEXT,
+    config,
+  });
+
+  await relay.notifyBlocked(BLOCKED_EVENT, config, [telegram]);
+
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: 'y' }]);
+  assert.equal(telegram.texts.length, 0, 'nothing is posted');
+  assert.equal(telegram.blocked.length, 0);
+});
+
+test('a command matching no rule is announced normally', async () => {
+  const telegram = fakeProvider('telegram');
+  const config = autoApproveConfig({ globs: ['npm test'] });
+  const { relay, answers } = build({
+    providers: [telegram],
+    options: PERMISSION_OPTIONS,
+    context: PERMISSION_CONTEXT,
+    config,
+  });
+
+  await relay.notifyBlocked(BLOCKED_EVENT, config, [telegram]);
+
+  assert.deepEqual(answers, [], 'nothing is typed into the pane');
+  assert.equal(telegram.blocked.length, 1, 'the normal question is posted');
+});
+
+test('autoApprove disabled leaves the existing behaviour untouched', async () => {
+  const telegram = fakeProvider('telegram');
+  const config = autoApproveConfig({ enabled: false });
+  const { relay, answers } = build({
+    providers: [telegram],
+    options: PERMISSION_OPTIONS,
+    context: PERMISSION_CONTEXT,
+    config,
+  });
+
+  await relay.notifyBlocked(BLOCKED_EVENT, config, [telegram]);
+
+  assert.deepEqual(answers, []);
+  assert.equal(telegram.blocked.length, 1);
+});
+
+test('a multi-choice menu is never auto-approved, even under a catch-all rule', async () => {
+  const telegram = fakeProvider('telegram');
+  const config = autoApproveConfig({ globs: ['*'] });
+  const { relay, answers } = build({
+    providers: [telegram],
+    options: [
+      { label: '1. Use the main branch', value: '1' },
+      { label: '2. Use the feature branch', value: '2' },
+    ],
+    context: PERMISSION_CONTEXT,
+    config,
+  });
+
+  await relay.notifyBlocked(BLOCKED_EVENT, config, [telegram]);
+
+  assert.deepEqual(answers, [], 'picking one of several real choices is not a permission grant');
+  assert.equal(telegram.blocked.length, 1);
+});
+
+test('a prompt naming no command is announced, even under a catch-all rule', async () => {
+  const telegram = fakeProvider('telegram');
+  const config = autoApproveConfig({ globs: ['*'] });
+  const { relay, answers } = build({
+    providers: [telegram],
+    options: PERMISSION_OPTIONS,
+    context: ' Do you trust the contents of this directory?',
+    config,
+  });
+
+  await relay.notifyBlocked(BLOCKED_EVENT, config, [telegram]);
+
+  assert.deepEqual(answers, [], 'no extractable command means no auto-approve');
+  assert.equal(telegram.blocked.length, 1);
+});
+
+test('a pane that cannot be answered falls back to announcing the question', async () => {
+  const telegram = fakeProvider('telegram');
+  const config = autoApproveConfig();
+  const { relay, logs } = build({
+    providers: [telegram],
+    options: PERMISSION_OPTIONS,
+    context: PERMISSION_CONTEXT,
+    answerFails: 'pane is gone',
+    config,
+  });
+
+  await relay.notifyBlocked(BLOCKED_EVENT, config, [telegram]);
+
+  assert.equal(telegram.blocked.length, 1, 'the user must still see a pane that is still blocked');
+  assert.ok(logs.some((line) => /auto-approve could not answer pane-1: pane is gone/.test(line)));
+});
+
+test('an invalid regex is reported and the valid rules still auto-approve', async () => {
+  const telegram = fakeProvider('telegram');
+  const config = autoApproveConfig({ globs: [], regexes: ['(unclosed', 'git status.*'] });
+  const { relay, answers, logs } = build({
+    providers: [telegram],
+    options: PERMISSION_OPTIONS,
+    context: PERMISSION_CONTEXT,
+    config,
+  });
+
+  await relay.notifyBlocked(BLOCKED_EVENT, config, [telegram]);
+
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: 'y' }]);
+  assert.ok(logs.some((line) => /invalid autoApprove regex/.test(line)));
+});
+
+test('a provider that cannot post the notice does not fail the auto-approval', async () => {
+  const telegram = fakeProvider('telegram');
+  telegram.sendText = async () => {
+    throw new Error('slack is down');
+  };
+  const config = autoApproveConfig();
+  const { relay, answers, logs } = build({
+    providers: [telegram],
+    options: PERMISSION_OPTIONS,
+    context: PERMISSION_CONTEXT,
+    config,
+  });
+
+  const failures = await relay.notifyBlocked(BLOCKED_EVENT, config, [telegram]);
+
+  assert.deepEqual(failures, [], 'the command already ran; a failed notice is not a failed notification');
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: 'y' }]);
+  assert.ok(logs.some((line) => /slack is down/.test(line)));
+});

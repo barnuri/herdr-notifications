@@ -148,3 +148,136 @@ test('entries missing pane_id or agent_status are ignored', () => {
   const events = watcher.update([agent('p1', 'idle')]);
   assert.deepEqual(events, []);
 });
+
+function fakeClock(startMs = 1000) {
+  const clock = {
+    now: startMs,
+    advance(ms) {
+      clock.now += ms;
+    },
+    read: () => clock.now,
+  };
+  return clock;
+}
+
+test('a working -> idle transition reports how long the pane was working', () => {
+  const clock = fakeClock();
+  const watcher = new StateWatcher({ now: clock.read });
+  watcher.update([agent('p1', 'working')]);
+  clock.advance(90_000);
+  const [event] = watcher.update([agent('p1', 'idle')]);
+  assert.equal(event.previousStatus, 'working');
+  assert.equal(event.previousStatusMs, 90_000);
+});
+
+test('a pane that stays in one status keeps its original entry time across polls', () => {
+  const clock = fakeClock();
+  const watcher = new StateWatcher({ now: clock.read });
+  watcher.update([agent('p1', 'working')]);
+  clock.advance(60_000);
+  watcher.update([agent('p1', 'working')]);
+  clock.advance(60_000);
+  const [event] = watcher.update([agent('p1', 'done')]);
+  assert.equal(event.previousStatusMs, 120_000);
+});
+
+test('a pane seen for the first time after the baseline reports an unknown duration', () => {
+  const clock = fakeClock();
+  const watcher = new StateWatcher({ now: clock.read });
+  watcher.update([agent('p1', 'working')]);
+  clock.advance(5_000);
+  const [event] = watcher.update([agent('p1', 'working'), agent('p2', 'blocked')]);
+  assert.equal(event.paneId, 'p2');
+  assert.equal(event.previousStatus, StateWatcher.UNKNOWN_PRIOR_STATUS);
+  assert.equal(event.previousStatusMs, StateWatcher.UNKNOWN_DURATION_MS);
+});
+
+test('a pane that disappears and comes back is timed from its reappearance, not its first life', () => {
+  const clock = fakeClock();
+  const watcher = new StateWatcher({ now: clock.read });
+  watcher.update([agent('p1', 'working')]);
+  clock.advance(600_000);
+  watcher.update([]);
+  clock.advance(1_000);
+  watcher.update([agent('p1', 'working')]);
+  clock.advance(30_000);
+  const [event] = watcher.update([agent('p1', 'done')]);
+  assert.equal(event.previousStatusMs, 30_000);
+});
+
+test('each status span is measured separately: working time does not leak into blocked time', () => {
+  const clock = fakeClock();
+  const watcher = new StateWatcher({ now: clock.read });
+  watcher.update([agent('p1', 'working')]);
+  clock.advance(300_000);
+  const [blockedEvent] = watcher.update([agent('p1', 'blocked')]);
+  assert.equal(blockedEvent.previousStatusMs, 300_000);
+  clock.advance(10_000);
+  const [doneEvent] = watcher.update([agent('p1', 'done')]);
+  assert.equal(doneEvent.previousStatus, 'blocked');
+  assert.equal(doneEvent.previousStatusMs, 10_000);
+});
+
+test('the default clock is wall time and produces a non-negative span', () => {
+  const watcher = new StateWatcher();
+  watcher.update([agent('p1', 'working')]);
+  const [event] = watcher.update([agent('p1', 'done')]);
+  assert.ok(event.previousStatusMs >= 0);
+});
+
+test('a done reached through idle still reports the working run that preceded it', () => {
+  const clock = fakeClock();
+  const watcher = new StateWatcher({ now: clock.read });
+  watcher.update([agent('p1', 'working')]);
+  clock.advance(3_600_000);
+  const [idleEvent] = watcher.update([agent('p1', 'idle')]);
+  assert.equal(idleEvent.workingMs, 3_600_000);
+  clock.advance(2_000);
+  const [doneEvent] = watcher.update([agent('p1', 'done')]);
+  assert.equal(doneEvent.previousStatus, 'idle');
+  assert.equal(doneEvent.previousStatusMs, 2_000);
+  assert.equal(doneEvent.workingMs, 3_600_000);
+});
+
+test('a done reached through blocked reports the working run, not the blocked wait', () => {
+  const clock = fakeClock();
+  const watcher = new StateWatcher({ now: clock.read });
+  watcher.update([agent('p1', 'working')]);
+  clock.advance(5_000);
+  watcher.update([agent('p1', 'blocked')]);
+  clock.advance(7_200_000);
+  const [doneEvent] = watcher.update([agent('p1', 'done')]);
+  assert.equal(doneEvent.previousStatusMs, 7_200_000);
+  assert.equal(doneEvent.workingMs, 5_000);
+});
+
+test('a second working run replaces the previously recorded span', () => {
+  const clock = fakeClock();
+  const watcher = new StateWatcher({ now: clock.read });
+  watcher.update([agent('p1', 'working')]);
+  clock.advance(3_600_000);
+  watcher.update([agent('p1', 'idle')]);
+  clock.advance(1_000);
+  watcher.update([agent('p1', 'working')]);
+  clock.advance(30_000);
+  const [event] = watcher.update([agent('p1', 'done')]);
+  assert.equal(event.workingMs, 30_000);
+});
+
+test('a pane that never worked reports an unknown working span', () => {
+  const clock = fakeClock();
+  const watcher = new StateWatcher({ now: clock.read });
+  watcher.update([agent('p1', 'idle')]);
+  clock.advance(600_000);
+  const [event] = watcher.update([agent('p1', 'done')]);
+  assert.equal(event.workingMs, StateWatcher.UNKNOWN_DURATION_MS);
+});
+
+test('a still-running pane has no finished working span to report', () => {
+  const clock = fakeClock();
+  const watcher = new StateWatcher({ now: clock.read });
+  watcher.update([agent('p1', 'working')]);
+  clock.advance(600_000);
+  const [event] = watcher.update([agent('p1', 'blocked')]);
+  assert.equal(event.workingMs, 600_000);
+});

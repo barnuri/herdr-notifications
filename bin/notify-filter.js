@@ -1,7 +1,7 @@
 'use strict';
 
 const { loadConfig, updateConfig } = require('../lib/config');
-const { PRESETS, findPreset, matchPresetId, nextPreset } = require('../lib/notify-filter');
+const { PRESETS, findPreset, matchPresetId, nextPreset, applyPresetToNotifyOn } = require('../lib/notify-filter');
 const { notifyDesktop } = require('../lib/herdr');
 
 const NOTIFICATION_TITLE = 'Herdr Notifications';
@@ -25,7 +25,7 @@ function resolvePreset(requestedId, currentNotifyOn) {
 
 async function main() {
   const preset = resolvePreset(process.argv[2], loadConfig().notifyOn);
-  updateConfig((raw) => ({ ...raw, notifyOn: { ...preset.notifyOn } }));
+  updateConfig((raw) => ({ ...raw, notifyOn: applyPresetToNotifyOn(raw.notifyOn, preset) }));
   await notifyDesktop(NOTIFICATION_TITLE, `Notify on: ${preset.title} — ${preset.summary}`);
   process.stdout.write(`notifyOn set to "${preset.id}" (${preset.summary})\n`);
 }

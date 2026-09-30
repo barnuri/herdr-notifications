@@ -205,3 +205,91 @@ test('a free-text option in a two-column prompt is still recognised', () => {
   assert.equal(options[1].label, '2. Type something');
   assert.equal(options[1].expectsText, true, 'the hint must survive the label being trimmed');
 });
+
+// Fixtures below are verbatim captures from a live cursor-agent 2026.09.08
+// session read through `herdr pane read --source visible`.
+const CURSOR_SHELL_APPROVAL = [
+  '───────────────────────────────────────────────────────────',
+  ' $  rm -f /tmp/nonexistent-xyz in .',
+  '',
+  ' Run this command?',
+  ' Delete protection is enabled • Not in team allowlist: rm -f /tmp/nonexistent-xyz',
+  '  → Run (once) (y)',
+  '    Skip & tell the agent what to do instead (esc or n)',
+].join('\n');
+
+const CURSOR_TRUST_DIALOG = [
+  '  ╭──────────────────────────────────────────────╮',
+  '  │  ⚠ Workspace Trust Required                  │',
+  '  │                                              │',
+  '  │  Do you trust the contents of this directory?│',
+  '  │                                              │',
+  '  │  ▶ [a] Trust this workspace                  │',
+  '  │    [q] Quit                                  │',
+  '  │                                              │',
+  '  ╰──────────────────────────────────────────────╯',
+].join('\n');
+
+test("cursor's shell-approval prompt yields the keys that answer it", () => {
+  const options = detectOptions(CURSOR_SHELL_APPROVAL);
+
+  assert.deepEqual(
+    options.map((option) => [option.label, option.value]),
+    [
+      ['Run (once)', 'y'],
+      ['Skip & tell the agent what to do instead', 'n'],
+    ],
+  );
+});
+
+test("cursor's skip option is marked free-text: choosing it opens an input", () => {
+  const [, skip] = detectOptions(CURSOR_SHELL_APPROVAL);
+
+  assert.equal(skip.expectsText, true);
+});
+
+test("cursor's bracketed trust dialog is detected through its box border", () => {
+  const options = detectOptions(CURSOR_TRUST_DIALOG);
+
+  assert.deepEqual(
+    options.map((option) => [option.label, option.value]),
+    [
+      ['Trust this workspace', 'a'],
+      ['Quit', 'q'],
+    ],
+  );
+});
+
+test('a numbered menu still wins over a keyed one', () => {
+  const prompt = ['1. Yes', '2. No', '  → Run (once) (y)', '    Skip (n)'].join('\n');
+
+  assert.deepEqual(
+    detectOptions(prompt).map((option) => option.value),
+    ['1', '2'],
+  );
+});
+
+test('prose lines ending in a parenthesised character are not a menu', () => {
+  const prose = [
+    'The command completed successfully (0)',
+    'Nothing else was changed (a)',
+  ].join('\n');
+
+  assert.deepEqual(detectOptions(prose), [], 'without a highlight marker there is no menu');
+});
+
+test('an ordinary cursor transcript with no prompt yields nothing', () => {
+  const transcript = [
+    '  $ pnpm test 4.1s',
+    '    … 9 output lines hidden · ctrl+o to expand',
+    '',
+    '  All tests passed.',
+    ' → Add a follow-up',
+  ].join('\n');
+
+  assert.deepEqual(detectOptions(transcript), []);
+});
+
+test('a keyed run needs at least two options', () => {
+  assert.deepEqual(detectOptions(' Continue?\n  → Run (once) (y)'), []);
+});

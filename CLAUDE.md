@@ -20,13 +20,28 @@ CONFIG_DIR="$(herdr plugin config-dir barnuri.notifications)"
 # `pkill -f` matches against every process's full command line, including the
 # shell running this very snippet (the pattern appears verbatim in its argv),
 # so pkill intermittently kills its own shell and the restart silently half-runs.
-# Match on the absolute script path, not just "bin/watch.js": a sibling plugin
-# (herdr-auto-update) runs the exact same relative command.
-for pid in $(pgrep -f "herdr-notifications/bin/watch\.js"); do
+#
+# Match on `bin/watch.js` plus the process's cwd — NOT on the absolute script
+# path. herdr spawns `[[startup]]` plugins with a *relative* argv (`node
+# bin/watch.js`) and cwd set to the plugin dir, so a pattern containing
+# "herdr-notifications/" never matches the very process this restart exists to
+# replace. Matching the bare relative path alone is also wrong: a sibling
+# plugin (herdr-auto-update) runs the identical command line, and cwd is the
+# only thing that tells them apart. Getting this wrong leaves the old process
+# alive alongside the new one, and both keep posting — the stale one's
+# (pre-change) notification lands last and looks like the fix never shipped.
+watch_pids() {
+  for pid in $(pgrep -f "bin/watch\.js"); do
+    case "$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | grep '^n' | sed 's/^n//')" in
+      "$PLUGIN_DIR") echo "$pid" ;;
+    esac
+  done
+}
+for pid in $(watch_pids); do
   kill "$pid" 2>/dev/null
 done
 # The process traps SIGTERM and exits at its next poll tick, not instantly.
-until [ -z "$(pgrep -f "herdr-notifications/bin/watch\.js")" ]; do sleep 1; done
+until [ -z "$(watch_pids)" ]; do sleep 1; done
 HERDR_PLUGIN_CONFIG_DIR="$CONFIG_DIR" nohup node "$PLUGIN_DIR/bin/watch.js" >> "$CONFIG_DIR/watch.log" 2>&1 &
 disown
 ```

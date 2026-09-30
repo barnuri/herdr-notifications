@@ -10,8 +10,12 @@ function okResponse(body) {
   return { status: 200, ok: true, body: { ok: true, ...body } };
 }
 
+// The conversations.history throttle is static (providers are rebuilt every
+// watcher tick), so it has to be cleared between tests or the first test in the
+// file starves every later one of its history call.
 function provider(httpClient, providerConfig = { botToken: 'xoxb-token', channelId: 'C1' }) {
-  return new SlackProvider({ providerConfig, httpClient });
+  SlackProvider.resetHistoryGates();
+  return new SlackProvider({ providerConfig, httpClient, log: () => {} });
 }
 
 test('isConfigured requires both a bot token and a channel id', () => {
@@ -191,25 +195,29 @@ test('the bot token never appears in an error message', async () => {
 // --- Socket Mode buttons (only when an app-level token is configured) ---
 
 function fakeSocket(events = []) {
-  const queue = [...events];
   return {
     starts: 0,
+    // Exposed so a test can queue a click between two polls, the way a real
+    // connection receives one while the history poll is paused.
+    queue: [...events],
     async start() {
       this.starts += 1;
     },
     drainEvents() {
-      const drained = [...queue];
-      queue.length = 0;
+      const drained = [...this.queue];
+      this.queue.length = 0;
       return drained;
     },
   };
 }
 
 function buttonProvider(httpClient, socket = fakeSocket()) {
+  SlackProvider.resetHistoryGates();
   return new SlackProvider({
     providerConfig: { botToken: 'xoxb-token', channelId: 'C1', appToken: 'xapp-token' },
     httpClient,
     socket,
+    log: () => {},
   });
 }
 
@@ -349,4 +357,138 @@ test('markAnswered replaces the blocks so the buttons stop being tappable', asyn
   assert.equal(http.calls[0].payload.blocks.length, 1);
   assert.equal(http.calls[0].payload.blocks[0].type, 'section');
   assert.match(http.calls[0].payload.text, /✅ Selected: \*Proceed\*/);
+});
+
+// --- Button clicks must survive a failing or throttled history poll ---
+//
+// Regression guard for the reason Slack buttons mostly did nothing: the socket
+// queue was drained first and conversations.history was called second, so any
+// failure there threw out of fetchInbound and took the already-drained clicks
+// with it. conversations.history is Tier 3 (~50/min) and the relay polls every
+// second, so that failure was the normal case, not the edge case.
+
+function clockedProvider(httpClient, { socket = fakeSocket(), now = () => 0 } = {}) {
+  SlackProvider.resetHistoryGates();
+  return new SlackProvider({
+    providerConfig: { botToken: 'xoxb-token', channelId: 'C1', appToken: 'xapp-token' },
+    httpClient,
+    socket,
+    now,
+    log: () => {},
+  });
+}
+
+function throwingHttp(message) {
+  const calls = [];
+  return {
+    calls,
+    client: {
+      async postJson(url, payload, options) {
+        calls.push({ url, payload, options });
+        throw new Error(message);
+      },
+    },
+  };
+}
+
+test('a button click is still delivered when conversations.history throws', async () => {
+  const http = throwingHttp('slack conversations.history failed: ratelimited');
+  const socket = fakeSocket([{ kind: 'action', id: 'a1', data: 'r:tok:0', channelId: 'C1' }]);
+
+  const { events, cursor } = await clockedProvider(http.client, { socket }).fetchInbound('100.1');
+
+  assert.equal(events.length, 1, 'the drained click must not be lost with the failed history poll');
+  assert.equal(events[0].data, 'r:tok:0');
+  assert.equal(cursor, '100.1', 'a failed history poll must not advance the cursor');
+});
+
+test('a button click is still delivered when conversations.history is rate limited', async () => {
+  const http = stubHttp({ status: 429, ok: false, body: { ok: false, error: 'ratelimited' }, retryAfterMs: 30000 });
+  const socket = fakeSocket([{ kind: 'action', id: 'a1', data: 'r:tok:1', channelId: 'C1' }]);
+
+  const { events, cursor } = await clockedProvider(http.client, { socket }).fetchInbound('100.1');
+
+  assert.deepEqual(
+    events.map((event) => event.data),
+    ['r:tok:1'],
+  );
+  assert.equal(cursor, '100.1');
+});
+
+test('a rate limit pauses history polls for the window Slack named, not the socket drain', async () => {
+  const http = stubHttp({ status: 429, ok: false, body: { ok: false, error: 'ratelimited' }, retryAfterMs: 30000 });
+  let nowMs = 0;
+  const socket = fakeSocket([{ kind: 'action', id: 'a1', data: 'r:tok:0', channelId: 'C1' }]);
+  const slack = clockedProvider(http.client, { socket, now: () => nowMs });
+
+  await slack.fetchInbound('100.1');
+  assert.equal(http.calls.length, 1);
+
+  // Still inside the Retry-After window: no further history call, but a click
+  // that arrived meanwhile is handed over regardless.
+  nowMs = 29000;
+  socket.queue.push({ kind: 'action', id: 'a2', data: 'r:tok:1', channelId: 'C1' });
+  const during = await slack.fetchInbound('100.1');
+  assert.equal(http.calls.length, 1, 'retrying inside the window only earns another 429');
+  assert.deepEqual(
+    during.events.map((event) => event.data),
+    ['r:tok:1'],
+  );
+
+  nowMs = 31000;
+  await slack.fetchInbound('100.1');
+  assert.equal(http.calls.length, 2, 'the history poll resumes once the window has passed');
+});
+
+test('history polls are throttled below the relay poll interval to stay inside Slack Tier 3', async () => {
+  const http = stubHttp(okResponse({ messages: [] }));
+  let nowMs = 0;
+  const slack = clockedProvider(http.client, { now: () => nowMs });
+
+  await slack.fetchInbound('100.1');
+  nowMs = SlackProvider.MIN_HISTORY_INTERVAL_MS - 1;
+  await slack.fetchInbound('100.1');
+  assert.equal(http.calls.length, 1, 'a second poll inside the interval is skipped');
+
+  nowMs = SlackProvider.MIN_HISTORY_INTERVAL_MS;
+  await slack.fetchInbound('100.1');
+  assert.equal(http.calls.length, 2);
+});
+
+test('a history failure is logged once per distinct reason, not once per poll', async () => {
+  const http = throwingHttp('slack conversations.history failed: ratelimited');
+  const lines = [];
+  SlackProvider.resetHistoryGates();
+  let nowMs = 0;
+  const slack = new SlackProvider({
+    providerConfig: { botToken: 'xoxb-token', channelId: 'C1', appToken: 'xapp-token' },
+    httpClient: http.client,
+    socket: fakeSocket(),
+    now: () => nowMs,
+    log: (line) => lines.push(line),
+  });
+
+  await slack.fetchInbound('100.1');
+  nowMs = 10000;
+  await slack.fetchInbound('100.1');
+
+  assert.equal(http.calls.length, 2);
+  assert.equal(lines.length, 1, 'a sustained failure must not grow the log without bound');
+  assert.match(lines[0], /ratelimited/);
+});
+
+test('an unroutable click is reported in the channel, since Socket Mode has no toast', async () => {
+  const http = stubHttp(okResponse({ ts: '9.9' }));
+  await provider(http.client).acknowledgeAction('trigger', 'This question has expired.', { failed: true });
+
+  assert.equal(http.calls.length, 1);
+  assert.equal(http.calls[0].url, 'https://slack.com/api/chat.postMessage');
+  assert.equal(http.calls[0].payload.text, 'This question has expired.');
+});
+
+test('a click that worked posts nothing, because markAnswered already shows it', async () => {
+  const http = stubHttp(okResponse({ ts: '9.9' }));
+  await provider(http.client).acknowledgeAction('trigger', 'Sent.');
+
+  assert.equal(http.calls.length, 0);
 });

@@ -4,6 +4,7 @@ const { loadConfig } = require('../lib/config');
 const { Notifier } = require('../lib/notifier');
 const { SocketModeConnection } = require('../lib/providers/slack-socket');
 const { Relay } = require('../lib/relay');
+const { SingleInstanceLock } = require('../lib/single-instance');
 
 const LOG_PREFIX = 'herdr-notifications';
 
@@ -12,11 +13,22 @@ function sleep(ms) {
 }
 
 async function main() {
+  // A second watcher against the same config is worse than useless: it opens a
+  // second Slack Socket Mode connection, and Slack hands each button click to
+  // exactly one connection, so half of them land in a process holding a stale
+  // snapshot of the relay state and are rejected as expired.
+  const releaseLock = SingleInstanceLock.acquire();
+  if (!releaseLock) {
+    process.stderr.write(`${LOG_PREFIX}: another watcher already holds ${SingleInstanceLock.path()}; exiting\n`);
+    return;
+  }
+
   const relay = new Relay();
   const notifier = new Notifier({ relay });
   let running = true;
   const stop = () => {
     running = false;
+    releaseLock();
     // Closed here rather than only after the loop: an open Slack Socket Mode
     // WebSocket keeps the event loop alive, so leaving it until the loop
     // unwinds delays shutdown by however long the in-flight polls take.
@@ -60,6 +72,7 @@ async function main() {
   // either call the process ignores SIGTERM entirely and lingers, accumulating
   // copies across herdr restarts that each double-handle every button click.
   SocketModeConnection.resetShared();
+  releaseLock();
 }
 
 main().catch((error) => {

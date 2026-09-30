@@ -269,3 +269,95 @@ test('a relay that throws is contained: the event is reported failed, not the wh
   assert.ok(logs.some((line) => line.includes('telegram send failed: herdr agent output read failed')));
   assert.equal(desktop.length, 1);
 });
+
+function statusRule({ enabled = true, minWorkingMs = 0, skipWhenFocused = false } = {}) {
+  return { enabled, minWorkingMs, skipWhenFocused };
+}
+
+test('a short run is filtered, not failed, and no provider is called', async () => {
+  const provider = fakeProvider('slack');
+  const { notifier } = build({
+    events: [{ type: 'done', paneId: 'pane-1', workingMs: 60_000, agent: { agent: 'a' } }],
+    providers: [provider],
+    config: baseConfig({ notifyOn: { done: statusRule({ minWorkingMs: 900000 }) } }),
+  });
+
+  const result = await notifier.tick();
+  assert.deepEqual(result, { sent: 0, filtered: 1, failed: 0 });
+  assert.equal(provider.sent.length, 0);
+});
+
+test('a long run is delivered', async () => {
+  const provider = fakeProvider('slack');
+  const { notifier } = build({
+    events: [{ type: 'done', paneId: 'pane-1', workingMs: 1_800_000, agent: { agent: 'a' } }],
+    providers: [provider],
+    config: baseConfig({ notifyOn: { done: statusRule({ minWorkingMs: 900000 }) } }),
+  });
+
+  const result = await notifier.tick();
+  assert.deepEqual(result, { sent: 1, filtered: 0, failed: 0 });
+  assert.equal(provider.sent.length, 1);
+});
+
+test('a focused pane is filtered when its status opts into focus suppression', async () => {
+  const provider = fakeProvider('slack');
+  const { notifier } = build({
+    events: [{ type: 'idle', paneId: 'pane-1', workingMs: 1_800_000, agent: { agent: 'a', focused: true } }],
+    providers: [provider],
+    config: baseConfig({ notifyOn: { idle: statusRule({ skipWhenFocused: true }) } }),
+  });
+
+  const result = await notifier.tick();
+  assert.deepEqual(result, { sent: 0, filtered: 1, failed: 0 });
+  assert.equal(provider.sent.length, 0);
+});
+
+test('one status being filtered does not suppress another in the same tick', async () => {
+  const provider = fakeProvider('slack');
+  const { notifier } = build({
+    events: [
+      { type: 'done', paneId: 'pane-1', workingMs: 5_000, agent: { agent: 'a' } },
+      { type: 'blocked', paneId: 'pane-2', workingMs: 5_000, agent: { agent: 'b' } },
+    ],
+    providers: [provider],
+    config: baseConfig({
+      notifyOn: { done: statusRule({ minWorkingMs: 900000 }), blocked: statusRule() },
+    }),
+  });
+
+  const result = await notifier.tick();
+  assert.deepEqual(result, { sent: 1, filtered: 1, failed: 0 });
+  assert.deepEqual(provider.sent.map((event) => event.type), ['blocked']);
+});
+
+test('a pane with no measurable run time is filtered when a threshold is set', async () => {
+  const provider = fakeProvider('slack');
+  const { notifier } = build({
+    events: [{ type: 'done', paneId: 'pane-1', workingMs: null, agent: { agent: 'a' } }],
+    providers: [provider],
+    config: baseConfig({ notifyOn: { done: statusRule({ minWorkingMs: 900000 }) } }),
+  });
+
+  assert.deepEqual(await notifier.tick(), { sent: 0, filtered: 1, failed: 0 });
+});
+
+test('a done event reached through idle is judged on the working run, not the idle gap', async () => {
+  const provider = fakeProvider('slack');
+  const { notifier } = build({
+    events: [
+      {
+        type: 'done',
+        paneId: 'pane-1',
+        previousStatus: 'idle',
+        previousStatusMs: 3_000,
+        workingMs: 3_600_000,
+        agent: { agent: 'a' },
+      },
+    ],
+    providers: [provider],
+    config: baseConfig({ notifyOn: { done: statusRule({ minWorkingMs: 900000 }) } }),
+  });
+
+  assert.deepEqual(await notifier.tick(), { sent: 1, filtered: 0, failed: 0 });
+});

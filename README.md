@@ -2,7 +2,9 @@
 
 A [herdr](https://github.com/herdr) plugin that messages you on **Telegram**, **Discord** and/or
 **Slack** when one of your coding agents changes state — goes **idle**, gets **blocked** (waiting
-for your input), or is **done**. Any combination of providers can run in parallel; it is all
+for your input), or is **done**. Each status is filtered independently: by default `idle` and
+`done` only notify for a run that lasted at least 15 minutes, so finishing something you just
+started and are still watching stays silent, while `blocked` always notifies. Any combination of providers can run in parallel; it is all
 driven by one config file. Zero runtime dependencies.
 
 ## How it works
@@ -105,9 +107,25 @@ at `$HERDR_PLUGIN_CONFIG_DIR/config.json` (fallback: `~/.config/herdr-notificati
     "enabled": true,
     "pollMs": 2000,
     "notifyOn": {
-        "idle": true,
-        "blocked": true,
-        "done": true
+        "defaults": {
+            "minWorkingMs": 900000,
+            "skipWhenFocused": false
+        },
+        "idle": {
+            "enabled": true,
+            "minWorkingMs": 900000,
+            "skipWhenFocused": false
+        },
+        "blocked": {
+            "enabled": true,
+            "minWorkingMs": 0,
+            "skipWhenFocused": false
+        },
+        "done": {
+            "enabled": true,
+            "minWorkingMs": 900000,
+            "skipWhenFocused": false
+        }
     },
     "relay": {
         "enabled": false,
@@ -141,9 +159,11 @@ at `$HERDR_PLUGIN_CONFIG_DIR/config.json` (fallback: `~/.config/herdr-notificati
 |---|---|---|
 | `enabled` | `true` | Master switch. `false` disables all notifications on all providers. |
 | `pollMs` | `2000` | Agent-status poll interval in milliseconds (minimum 500). |
-| `notifyOn.idle` | `true` | Notify when an agent goes idle. |
-| `notifyOn.blocked` | `true` | Notify when an agent is blocked / needs input. |
-| `notifyOn.done` | `true` | Notify when an agent finishes. |
+| `notifyOn.<status>.enabled` | `true` | Whether this status notifies at all. `<status>` is `idle`, `blocked`, or `done`. |
+| `notifyOn.<status>.minWorkingMs` | `900000` for `idle`/`done`, `0` for `blocked` | Suppress the notification unless the pane's most recent finished `working` run lasted at least this long. Measured across intermediate states, so a `done` reached via `idle` is still judged on the work that preceded it. `0` disables the check. |
+| `notifyOn.<status>.skipWhenFocused` | `false` | Suppress the notification when that pane is the one you are looking at. |
+| `notifyOn.defaults.minWorkingMs` | — | Applies to every status that does not set its own. |
+| `notifyOn.defaults.skipWhenFocused` | — | Applies to every status that does not set its own. |
 | `relay.enabled` | `false` | Master switch for the interactive relay. Off by default. |
 | `relay.contextLines` | `40` | Lines of recent pane output to capture and show for a blocked agent (1–200). |
 | `relay.pollMs` | `1000` | How often to poll each provider for replies (minimum 500). Independent of `pollMs`. |
@@ -175,8 +195,9 @@ filter** action steps through three presets without editing JSON:
 | `blocked-only` | blocked 🔴 | you only want approval/input prompts |
 
 Each run advances to the next preset and shows a desktop toast with the new setting. Any
-hand-edited combination counts as custom, and the next run resets it to `all`. To set one directly
-instead of cycling:
+hand-edited combination counts as custom, and the next run resets it to `all`. A preset only
+toggles `enabled`, so the `minWorkingMs` / `skipWhenFocused` rules a status carries survive a
+cycle untouched. To set one directly instead of cycling:
 
 ```bash
 node bin/notify-filter.js needs-me

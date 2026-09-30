@@ -415,3 +415,36 @@ test('the recorded question survives a reload so a restart can still follow up',
     optionsKey: RelayStateStore.optionsKey([{ value: '1' }, { value: '2' }]),
   });
 });
+
+test('state written by another process is picked up instead of a stale snapshot', () => {
+  const store = new RelayStateStore();
+  store.trackBlocked('%1', { deliveries: [telegramDelivery()], token: 'mine', options: [{ label: '1', value: '1' }] });
+
+  // Stands in for a second watcher (or a one-shot action script) answering a
+  // question this process never saw. Without a re-read, the click that names
+  // `theirs` is rejected as expired even though the question is live.
+  const onDisk = JSON.parse(fs.readFileSync(statePath(), 'utf8'));
+  onDisk.tokens.theirs = { paneId: '%9', options: [{ label: '1. Yes', value: '1' }] };
+  writeStateFile(onDisk);
+  fs.utimesSync(statePath(), new Date(), new Date(Date.now() + 1000));
+
+  assert.deepEqual(store.resolveByToken('theirs'), { paneId: '%9', options: [{ label: '1. Yes', value: '1' }] });
+});
+
+test("a store's own writes are not re-read back over its in-memory state", () => {
+  const store = new RelayStateStore();
+  store.trackBlocked('%1', { deliveries: [telegramDelivery()], token: 'mine', options: [{ label: '1', value: '1' }] });
+
+  assert.equal(store.resolveByToken('mine').paneId, '%1');
+  assert.deepEqual(store.getBlockedPanes(), ['%1']);
+});
+
+test('a state file deleted underneath the store reads as empty rather than throwing', () => {
+  const store = new RelayStateStore();
+  store.trackBlocked('%1', { deliveries: [telegramDelivery()], token: 'mine', options: [{ label: '1', value: '1' }] });
+
+  fs.rmSync(statePath());
+
+  assert.equal(store.resolveByToken('mine'), null);
+  assert.deepEqual(store.getBlockedPanes(), []);
+});

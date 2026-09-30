@@ -6,7 +6,14 @@ const os = require('node:os');
 const path = require('node:path');
 const { test, beforeEach, afterEach } = require('node:test');
 
-const { PRESETS, CUSTOM_PRESET_ID, findPreset, matchPresetId, nextPreset } = require('../lib/notify-filter');
+const {
+  PRESETS,
+  CUSTOM_PRESET_ID,
+  findPreset,
+  matchPresetId,
+  nextPreset,
+  applyPresetToNotifyOn,
+} = require('../lib/notify-filter');
 const { resolvePreset } = require('../bin/notify-filter');
 const { loadConfig, updateConfig, configPath } = require('../lib/config');
 
@@ -87,7 +94,7 @@ test('applying a preset rewrites notifyOn and preserves other config keys', () =
   assert.equal(written.providers.telegram.botToken, 'token');
   assert.equal(written.providers.slack.channelId, 'C1');
   assert.equal(written.futureKey, 7);
-  assert.equal(loadConfig().notifyOn.done, false);
+  assert.equal(loadConfig().notifyOn.done.enabled, false);
   assert.equal(loadConfig().providers.slack.enabled, true, 'the filter action must not disturb provider settings');
 });
 
@@ -96,5 +103,51 @@ test('applying a preset to a missing config file creates it with mode 0600', () 
   updateConfig((raw) => ({ ...raw, notifyOn: { ...preset.notifyOn } }));
 
   assert.equal(fs.statSync(configPath()).mode & 0o777, 0o600);
-  assert.deepEqual(loadConfig().notifyOn, { idle: false, blocked: true, done: false });
+  const { notifyOn } = loadConfig();
+  assert.deepEqual(
+    { idle: notifyOn.idle.enabled, blocked: notifyOn.blocked.enabled, done: notifyOn.done.enabled },
+    { idle: false, blocked: true, done: false },
+  );
+});
+
+test('cycling a preset keeps each status duration and focus rule intact', () => {
+  fs.writeFileSync(
+    configPath(),
+    JSON.stringify({
+      notifyOn: {
+        defaults: { minWorkingMs: 45000 },
+        idle: { enabled: false, minWorkingMs: 120000, skipWhenFocused: true },
+        blocked: { enabled: true, minWorkingMs: 0, skipWhenFocused: false },
+        done: { enabled: false, minWorkingMs: 600000, skipWhenFocused: false },
+      },
+    }),
+  );
+
+  const preset = findPreset('all');
+  updateConfig((raw) => ({ ...raw, notifyOn: applyPresetToNotifyOn(raw.notifyOn, preset) }));
+
+  const written = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
+  assert.deepEqual(written.notifyOn.idle, { enabled: true, minWorkingMs: 120000, skipWhenFocused: true });
+  assert.deepEqual(written.notifyOn.done, { enabled: true, minWorkingMs: 600000, skipWhenFocused: false });
+  assert.deepEqual(written.notifyOn.defaults, { minWorkingMs: 45000 });
+});
+
+test('a preset applied to the legacy boolean shape stays boolean', () => {
+  fs.writeFileSync(configPath(), JSON.stringify({ notifyOn: { idle: true, blocked: true, done: true } }));
+
+  updateConfig((raw) => ({ ...raw, notifyOn: applyPresetToNotifyOn(raw.notifyOn, findPreset('blocked-only')) }));
+
+  const written = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
+  assert.deepEqual(written.notifyOn, { idle: false, blocked: true, done: false });
+});
+
+test('matchPresetId reads the object shape, ignoring duration and focus rules', () => {
+  assert.equal(
+    matchPresetId({
+      idle: { enabled: true, minWorkingMs: 900000, skipWhenFocused: true },
+      blocked: { enabled: true, minWorkingMs: 0, skipWhenFocused: false },
+      done: { enabled: false, minWorkingMs: 900000, skipWhenFocused: false },
+    }),
+    'needs-me',
+  );
 });

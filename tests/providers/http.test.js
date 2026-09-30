@@ -144,3 +144,47 @@ test('decodeSlackEnvelope throws the Slack error string when ok is false', () =>
 test('decodeSlackEnvelope falls back to the HTTP status when there is no body', () => {
   assert.throws(() => decodeSlackEnvelope({ status: 503, ok: false, body: null }, 'slack x'), /slack x failed: HTTP 503/);
 });
+
+// Retry-After only matters on a 429, and Slack's conversations.history returns
+// one often enough that honouring it is what keeps the relay from spending its
+// whole quota on rejected retries.
+function rateLimited(retryAfter) {
+  return {
+    status: 429,
+    ok: false,
+    headers: { get: (name) => (name === 'retry-after' ? retryAfter : null) },
+    json: async () => ({ ok: false, error: 'ratelimited' }),
+  };
+}
+
+function clientReturning(response) {
+  return new HttpJsonClient({ fetchImpl: async () => response });
+}
+
+test('a 429 reports its Retry-After window in milliseconds', async () => {
+  const result = await clientReturning(rateLimited('30')).postJson('https://example.test/x', {}, { label: 'x' });
+
+  assert.equal(result.retryAfterMs, 30000);
+});
+
+test('a 429 without a Retry-After header falls back to a full minute', async () => {
+  const result = await clientReturning(rateLimited(null)).postJson('https://example.test/x', {}, { label: 'x' });
+
+  assert.equal(result.retryAfterMs, HttpJsonClient.DEFAULT_RETRY_AFTER_MS);
+});
+
+test('an unparseable Retry-After does not become a zero-length pause', async () => {
+  const result = await clientReturning(rateLimited('soon')).postJson('https://example.test/x', {}, { label: 'x' });
+
+  assert.equal(result.retryAfterMs, HttpJsonClient.DEFAULT_RETRY_AFTER_MS);
+});
+
+test('any status other than 429 carries no retry window at all', async () => {
+  const result = await clientReturning(jsonResponse({ ok: false }, { status: 500 })).postJson(
+    'https://example.test/x',
+    {},
+    { label: 'x' },
+  );
+
+  assert.equal('retryAfterMs' in result, false, 'absence is the signal that nothing was rate limited');
+});
