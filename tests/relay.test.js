@@ -946,6 +946,61 @@ test('an invalid regex is reported and the valid rules still auto-approve', asyn
   assert.ok(logs.some((line) => /invalid autoApprove regex/.test(line)));
 });
 
+const FOLDER_EVENT = { type: 'blocked', paneId: 'pane-1', agent: { agent: 'agent-a', cwd: '/work/trusted/app' } };
+
+test('a prompt from an agent inside a trusted folder is approved without a command rule', async () => {
+  const telegram = fakeProvider('telegram');
+  const config = autoApproveConfig({ globs: [], folders: ['/work/trusted'] });
+  const { relay, answers } = build({
+    providers: [telegram],
+    options: PERMISSION_OPTIONS,
+    context: ' Do you want to make this edit to a.js?',
+    config,
+  });
+
+  await relay.notifyBlocked(FOLDER_EVENT, config, [telegram]);
+
+  assert.deepEqual(answers, [{ paneId: 'pane-1', text: 'y' }]);
+  assert.equal(telegram.blocked.length, 0);
+  assert.match(telegram.texts[0], /no command shown/);
+  assert.match(telegram.texts[0], /folder "\/work\/trusted"/);
+});
+
+test('a trusted folder never answers a multi-choice menu', async () => {
+  const telegram = fakeProvider('telegram');
+  const config = autoApproveConfig({ globs: [], folders: ['/work/trusted'] });
+  const { relay, answers } = build({
+    providers: [telegram],
+    options: [
+      { label: '1. Use the main branch', value: '1' },
+      { label: '2. Use the feature branch', value: '2' },
+    ],
+    context: PERMISSION_CONTEXT,
+    config,
+  });
+
+  await relay.notifyBlocked(FOLDER_EVENT, config, [telegram]);
+
+  assert.deepEqual(answers, []);
+  assert.equal(telegram.blocked.length, 1);
+});
+
+test('an agent outside every trusted folder is announced normally', async () => {
+  const telegram = fakeProvider('telegram');
+  const config = autoApproveConfig({ globs: [], folders: ['/work/other'] });
+  const { relay, answers } = build({
+    providers: [telegram],
+    options: PERMISSION_OPTIONS,
+    context: PERMISSION_CONTEXT,
+    config,
+  });
+
+  await relay.notifyBlocked(FOLDER_EVENT, config, [telegram]);
+
+  assert.deepEqual(answers, []);
+  assert.equal(telegram.blocked.length, 1);
+});
+
 test('a provider that cannot post the notice does not fail the auto-approval', async () => {
   const telegram = fakeProvider('telegram');
   telegram.sendText = async () => {

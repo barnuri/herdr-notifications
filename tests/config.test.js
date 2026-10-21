@@ -312,7 +312,7 @@ test('an explicit telegram block fills only the fields it omits from the legacy 
 test('autoApprove defaults to off with empty rule lists', () => {
   const config = loadConfig();
 
-  assert.deepEqual(config.autoApprove, { enabled: false, notify: true, globs: [], regexes: [] });
+  assert.deepEqual(config.autoApprove, { enabled: false, notify: true, globs: [], regexes: [], folders: [] });
 });
 
 test('autoApprove booleans and pattern lists are read from the file', () => {
@@ -325,7 +325,14 @@ test('autoApprove booleans and pattern lists are read from the file', () => {
     notify: false,
     globs: ['git status*'],
     regexes: ['npm (test|run lint)'],
+    folders: [],
   });
+});
+
+test('autoApprove folders are read, trimmed, and unusable ones dropped', () => {
+  writeConfigFile({ autoApprove: { folders: ['  ~/repo  ', '', 7] } });
+
+  assert.deepEqual(loadConfig().autoApprove.folders, ['~/repo']);
 });
 
 test('autoApprove pattern entries are trimmed, and unusable ones dropped', () => {
@@ -350,7 +357,7 @@ test('a non-array pattern list falls back to empty rather than throwing', () => 
 test('a non-object autoApprove block falls back to defaults', () => {
   writeConfigFile({ autoApprove: 'yes please' });
 
-  assert.deepEqual(loadConfig().autoApprove, { enabled: false, notify: true, globs: [], regexes: [] });
+  assert.deepEqual(loadConfig().autoApprove, { enabled: false, notify: true, globs: [], regexes: [], folders: [] });
 });
 
 test('autoApprove notify defaults to true when only enabled is set', () => {

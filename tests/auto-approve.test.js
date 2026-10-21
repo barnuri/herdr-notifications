@@ -80,3 +80,21 @@ test('the first matching rule is the one reported', () => {
 
   assert.deepEqual(rules.match('git status'), { kind: 'glob', pattern: 'git *' });
 });
+
+test('a folder rule covers the folder and everything below it, by path segment', () => {
+  const { rules } = compile({ folders: ['/work/repo/'] });
+
+  assert.equal(rules.size, 1);
+  assert.deepEqual(rules.matchFolder('/work/repo'), { kind: 'folder', pattern: '/work/repo/' });
+  assert.ok(rules.matchFolder('/work/repo/packages/a'));
+  assert.equal(rules.matchFolder('/work/repo-other'), null, 'a sibling with a shared prefix is not inside');
+  assert.equal(rules.matchFolder('/work'), null);
+  assert.equal(rules.matchFolder(undefined), null);
+  assert.equal(rules.match('/work/repo'), null, 'folder rules never match a command');
+});
+
+test('a folder rule expands a leading ~ to the home directory', () => {
+  const { rules } = compile({ folders: ['~/repo'] });
+
+  assert.ok(rules.matchFolder(require('node:path').join(require('node:os').homedir(), 'repo', 'src')));
+});
