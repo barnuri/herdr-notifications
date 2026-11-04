@@ -361,3 +361,99 @@ test('a done event reached through idle is judged on the working run, not the id
 
   assert.deepEqual(await notifier.tick(), { sent: 1, filtered: 0, failed: 0 });
 });
+
+function delayedBuild({ events, agents, clock, notifyOn, providers, relay = null }) {
+  let index = 0;
+  const watcher = {
+    update: () => events[index++] || [],
+    reset: () => {},
+  };
+  const config = baseConfig({ notifyOn, providers: {}, relay: { enabled: relay !== null, contextLines: 40, pollMs: 1000 } });
+  return new Notifier({
+    loadConfig: () => config,
+    listAgents: async () => agents,
+    createProviders: () => ({ providers, unconfigured: [] }),
+    notifyDesktop: async () => {},
+    watcher,
+    log: () => {},
+    relay,
+    now: () => clock.value,
+  });
+}
+
+const DELAYED = { enabled: true, minWorkingMs: 0, skipWhenFocused: false, delaySeconds: 300 };
+
+test('a delayed event is held until its delay elapses, then sent', async () => {
+  const clock = { value: 0 };
+  const provider = fakeProvider('telegram');
+  const agents = [{ pane_id: 'pane-2', agent_status: 'done' }];
+  const notifier = delayedBuild({
+    events: [[DONE_EVENT], [], []],
+    agents,
+    clock,
+    notifyOn: { done: DELAYED },
+    providers: [provider],
+  });
+
+  assert.equal((await notifier.tick()).sent, 0);
+  clock.value = 299_999;
+  assert.equal((await notifier.tick()).sent, 0);
+  clock.value = 300_000;
+  assert.equal((await notifier.tick()).sent, 1);
+  assert.equal(provider.sent.length, 1);
+});
+
+test('a delayed event is dropped when the pane is no longer in that status', async () => {
+  const clock = { value: 0 };
+  const provider = fakeProvider('telegram');
+  const notifier = delayedBuild({
+    events: [[DONE_EVENT], []],
+    agents: [{ pane_id: 'pane-2', agent_status: 'working' }],
+    clock,
+    notifyOn: { done: DELAYED },
+    providers: [provider],
+  });
+
+  await notifier.tick();
+  clock.value = 300_000;
+  const result = await notifier.tick();
+
+  assert.equal(result.sent, 0);
+  assert.deepEqual(provider.sent, []);
+});
+
+test('a zero delay sends on the same tick', async () => {
+  const provider = fakeProvider('telegram');
+  const notifier = delayedBuild({
+    events: [[DONE_EVENT]],
+    agents: [],
+    clock: { value: 0 },
+    notifyOn: { done: { ...DELAYED, delaySeconds: 0 } },
+    providers: [provider],
+  });
+
+  assert.equal((await notifier.tick()).sent, 1);
+});
+
+test('a blocked event routed through the relay is never held back', async () => {
+  const provider = fakeProvider('telegram');
+  const relayCalls = [];
+  const relay = {
+    async notifyBlocked(event) {
+      relayCalls.push(event);
+      return [];
+    },
+  };
+  const notifier = delayedBuild({
+    events: [[BLOCKED_EVENT]],
+    agents: [],
+    clock: { value: 0 },
+    notifyOn: { blocked: { ...DELAYED, minWorkingMs: 0 } },
+    providers: [provider],
+    relay,
+  });
+
+  await notifier.tick();
+
+  assert.equal(relayCalls.length, 1);
+});

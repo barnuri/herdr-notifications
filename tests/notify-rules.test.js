@@ -14,6 +14,7 @@ test('a legacy boolean status resolves to an unfiltered rule', () => {
     enabled: true,
     minWorkingMs: 0,
     skipWhenFocused: false,
+    delayMs: 0,
   });
 });
 
@@ -27,6 +28,7 @@ test('an object status keeps its duration and focus rule', () => {
     enabled: true,
     minWorkingMs: 1000,
     skipWhenFocused: true,
+    delayMs: 0,
   });
 });
 

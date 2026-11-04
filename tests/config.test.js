@@ -92,7 +92,7 @@ test('a per-status object configures duration and focus independently', () => {
     },
   });
   const { notifyOn } = loadConfig();
-  assert.deepEqual(notifyOn.idle, { enabled: true, minWorkingMs: 60000, skipWhenFocused: true });
+  assert.deepEqual(notifyOn.idle, { enabled: true, minWorkingMs: 60000, skipWhenFocused: true, delaySeconds: 0 });
   assert.equal(notifyOn.done.enabled, false);
   assert.equal(notifyOn.done.minWorkingMs, 900000);
 });
@@ -367,4 +367,17 @@ test('autoApprove notify defaults to true when only enabled is set', () => {
 
   assert.equal(autoApprove.enabled, true);
   assert.equal(autoApprove.notify, true);
+});
+
+test('delaySeconds defaults to zero and accepts a per-status value and a shared default', () => {
+  writeConfigFile({ notifyOn: { defaults: { delaySeconds: 300 }, idle: { delaySeconds: 60 } } });
+  const { notifyOn } = loadConfig();
+  assert.equal(notifyOn.idle.delaySeconds, 60);
+  assert.equal(notifyOn.done.delaySeconds, 300);
+  assert.equal(notifyOn.blocked.delaySeconds, 300);
+});
+
+test('a negative delaySeconds is clamped to zero', () => {
+  writeConfigFile({ notifyOn: { done: { delaySeconds: -10 } } });
+  assert.equal(loadConfig().notifyOn.done.delaySeconds, 0);
 });
