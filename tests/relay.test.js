@@ -35,6 +35,7 @@ function fakeProvider(id, { inbound = [], failSendBlocked = null, failMarkAnswer
     texts: [],
     prompts: [],
     answered: [],
+    resolved: [],
     acknowledged: [],
     fetched: [],
     isConfigured: () => true,
@@ -58,6 +59,9 @@ function fakeProvider(id, { inbound = [], failSendBlocked = null, failMarkAnswer
         throw new Error('too old to edit');
       }
       this.answered.push(payload);
+    },
+    async markResolved(payload) {
+      this.resolved.push(payload);
     },
     async acknowledgeAction(actionId, text) {
       this.acknowledged.push({ actionId, text });
@@ -116,6 +120,9 @@ function fakeStore() {
     getBlockedPanes: () => [...state.blockedPanes],
     getQuestion: (paneId) => state.questions[paneId] || null,
     getDeliveries: (paneId) => state.deliveries[paneId] || [],
+    clearDeliveries: (paneId) => {
+      delete state.deliveries[paneId];
+    },
     expirePane: (paneId) => {
       state.blockedPanes = state.blockedPanes.filter((pane) => pane !== paneId);
       delete state.deliveries[paneId];
@@ -285,6 +292,38 @@ test('a button press answers the pane with the selected option value', async () 
   assert.deepEqual(answers, [{ paneId: 'pane-1', text: '2' }]);
   assert.deepEqual(telegram.acknowledged, [{ actionId: 'cb-1', text: 'Sent.' }]);
   assert.deepEqual(store.getBlockedPanes(), []);
+});
+
+test('a pane answered outside the relay marks its messages resolved and drops its buttons', async () => {
+  const telegram = fakeProvider('telegram');
+  const discord = fakeProvider('discord');
+  const { relay, store } = build({ providers: [telegram, discord] });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram, discord]);
+  const staleToken = telegram.blocked[0].token;
+
+  await relay.resolvePane('pane-1');
+
+  assert.deepEqual(telegram.resolved, [{ messageId: 'telegram-msg-1', baseText: 'telegram base' }]);
+  assert.deepEqual(discord.resolved, [{ messageId: 'discord-msg-1', baseText: 'discord base' }]);
+  assert.deepEqual(store.getBlockedPanes(), []);
+  assert.equal(store.resolveByToken(staleToken), null, 'a stale button can no longer answer the pane');
+});
+
+test('resolving a pane whose question the relay already answered edits nothing', async () => {
+  const telegram = fakeProvider('telegram');
+  const store = fakeStore();
+  const { relay, answers } = build({ providers: [telegram], store });
+  await relay.notifyBlocked(BLOCKED_EVENT, relayConfig(), [telegram]);
+  telegram.fetchInbound = async () => ({
+    events: [{ kind: 'action', id: '1', actionId: 'cb-1', data: `r:${telegram.blocked[0].token}:0`, messageId: 'telegram-msg-1' }],
+    cursor: 5,
+  });
+  await relay.pollUpdates();
+
+  await relay.resolvePane('pane-1');
+
+  assert.equal(answers.length, 1);
+  assert.deepEqual(telegram.resolved, []);
 });
 
 test('an answered question is marked answered on every provider that received it', async () => {

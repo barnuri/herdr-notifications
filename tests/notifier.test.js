@@ -168,7 +168,10 @@ test('a blocked event goes through the relay when the relay is enabled', async (
   const provider = fakeProvider('telegram');
   const relayCalls = [];
   const relay = {
-    async notifyBlocked(event, currentConfig, providers) {
+    async tryAutoApprove() {
+      return false;
+    },
+    async announceBlocked(event, currentConfig, providers) {
       relayCalls.push({ event, providers });
       return [];
     },
@@ -192,7 +195,10 @@ test('a non-blocked event never goes through the relay', async () => {
   const provider = fakeProvider('telegram');
   let relayCalled = false;
   const relay = {
-    async notifyBlocked() {
+    async tryAutoApprove() {
+      return false;
+    },
+    async announceBlocked() {
       relayCalled = true;
       return [];
     },
@@ -214,7 +220,10 @@ test('a blocked event uses the plain path when the relay is disabled', async () 
   const provider = fakeProvider('telegram');
   let relayCalled = false;
   const relay = {
-    async notifyBlocked() {
+    async tryAutoApprove() {
+      return false;
+    },
+    async announceBlocked() {
       relayCalled = true;
       return [];
     },
@@ -230,7 +239,10 @@ test('a blocked event uses the plain path when the relay is disabled', async () 
 test('relay failures are reported the same way as plain send failures', async () => {
   const provider = fakeProvider('telegram');
   const relay = {
-    async notifyBlocked() {
+    async tryAutoApprove() {
+      return false;
+    },
+    async announceBlocked() {
       return [{ providerId: 'telegram', message: 'telegram sendMessage failed: chat not found' }];
     },
   };
@@ -251,7 +263,10 @@ test('relay failures are reported the same way as plain send failures', async ()
 test('a relay that throws is contained: the event is reported failed, not the whole tick', async () => {
   const provider = fakeProvider('telegram');
   const relay = {
-    async notifyBlocked() {
+    async tryAutoApprove() {
+      return false;
+    },
+    async announceBlocked() {
       throw new Error('herdr agent output read failed');
     },
   };
@@ -435,12 +450,42 @@ test('a zero delay sends on the same tick', async () => {
   assert.equal((await notifier.tick()).sent, 1);
 });
 
-test('a blocked event routed through the relay is never held back', async () => {
-  const provider = fakeProvider('telegram');
-  const relayCalls = [];
+test('a delayed blocked event is announced through the relay only when due', async () => {
+  const clock = { value: 0 };
+  const announced = [];
   const relay = {
-    async notifyBlocked(event) {
-      relayCalls.push(event);
+    async tryAutoApprove() {
+      return false;
+    },
+    async announceBlocked(event) {
+      announced.push(event);
+      return [];
+    },
+  };
+  const notifier = delayedBuild({
+    events: [[BLOCKED_EVENT], []],
+    agents: [{ pane_id: 'pane-1', agent_status: 'blocked' }],
+    clock,
+    notifyOn: { blocked: { ...DELAYED, minWorkingMs: 0 } },
+    providers: [fakeProvider('telegram')],
+    relay,
+  });
+
+  await notifier.tick();
+  assert.equal(announced.length, 0);
+  clock.value = 300_000;
+  await notifier.tick();
+  assert.equal(announced.length, 1);
+});
+
+test('an auto-approved blocked event is answered at once and never announced or delayed', async () => {
+  const announced = [];
+  const relay = {
+    async tryAutoApprove() {
+      return true;
+    },
+    async announceBlocked() {
+      announced.push(true);
       return [];
     },
   };
@@ -449,11 +494,10 @@ test('a blocked event routed through the relay is never held back', async () => 
     agents: [],
     clock: { value: 0 },
     notifyOn: { blocked: { ...DELAYED, minWorkingMs: 0 } },
-    providers: [provider],
+    providers: [fakeProvider('telegram')],
     relay,
   });
 
-  await notifier.tick();
-
-  assert.equal(relayCalls.length, 1);
+  assert.equal((await notifier.tick()).sent, 1);
+  assert.equal(announced.length, 0);
 });

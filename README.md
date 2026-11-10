@@ -162,7 +162,7 @@ at `$HERDR_PLUGIN_CONFIG_DIR/config.json` (fallback: `~/.config/herdr-notificati
 | `notifyOn.<status>.enabled` | `true` | Whether this status notifies at all. `<status>` is `idle`, `blocked`, or `done`. |
 | `notifyOn.<status>.minWorkingMs` | `900000` for `idle`/`done`, `0` for `blocked` | Suppress the notification unless the pane's most recent finished `working` run lasted at least this long. Measured across intermediate states, so a `done` reached via `idle` is still judged on the work that preceded it. `0` disables the check. |
 | `notifyOn.<status>.skipWhenFocused` | `false` | Suppress the notification when that pane is the one you are looking at. |
-| `notifyOn.<status>.delaySeconds` | `0` | Hold the notification this many seconds, then send it only if the pane is still in that status. A newer status change for the pane cancels the held send. Blocked events routed through the relay are never delayed, so auto-approve stays immediate. |
+| `notifyOn.<status>.delaySeconds` | `0` | Hold the notification this many seconds, then send it only if the pane is still in that status. A newer status change for the pane cancels the held send. Auto-approval still answers a blocked prompt at once. Only the notification is delayed; the pane is re-read when it comes due, so the message shows the current question. |
 | `notifyOn.defaults.minWorkingMs` | — | Applies to every status that does not set its own. |
 | `notifyOn.defaults.skipWhenFocused` | — | Applies to every status that does not set its own. |
 | `relay.enabled` | `false` | Master switch for the interactive relay. Off by default. |

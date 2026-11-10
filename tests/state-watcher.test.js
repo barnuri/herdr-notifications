@@ -71,11 +71,21 @@ test('any -> done emits a done event', () => {
   );
 });
 
-test('blocked -> idle emits nothing', () => {
+test('blocked -> idle emits a resolved event, not an idle one', () => {
   const watcher = new StateWatcher();
   watcher.update([agent('p1', 'blocked')]);
   const events = watcher.update([agent('p1', 'idle')]);
-  assert.deepEqual(events, []);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, 'resolved');
+  assert.equal(events[0].previousStatus, 'blocked');
+});
+
+test('blocked -> done still emits done', () => {
+  const watcher = new StateWatcher();
+  watcher.update([agent('p1', 'blocked')]);
+  const events = watcher.update([agent('p1', 'done')]);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, 'done');
 });
 
 test('transition into unknown emits nothing', () => {
