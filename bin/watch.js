@@ -5,11 +5,32 @@ const { Notifier } = require('../lib/notifier');
 const { SocketModeConnection } = require('../lib/providers/slack-socket');
 const { Relay } = require('../lib/relay');
 const { SingleInstanceLock } = require('../lib/single-instance');
+const { HcEventSource } = require('../lib/hc');
 
 const LOG_PREFIX = 'herdr-notifications';
+// `--wait-lock`: the standalone (launchd) watcher waits for the lock instead
+// of exiting, so it takes over when the herdr TUI's own watcher stops.
+const WAIT_LOCK_FLAG = '--wait-lock';
+const WAIT_LOCK_RETRY_MS = 30000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function acquireLock() {
+  const waitForLock = process.argv.includes(WAIT_LOCK_FLAG);
+  let announced = false;
+  for (;;) {
+    const releaseLock = SingleInstanceLock.acquire();
+    if (releaseLock || !waitForLock) {
+      return releaseLock;
+    }
+    if (!announced) {
+      process.stderr.write(`${LOG_PREFIX}: another watcher holds ${SingleInstanceLock.path()}; waiting\n`);
+      announced = true;
+    }
+    await sleep(WAIT_LOCK_RETRY_MS);
+  }
 }
 
 async function main() {
@@ -17,18 +38,20 @@ async function main() {
   // second Slack Socket Mode connection, and Slack hands each button click to
   // exactly one connection, so half of them land in a process holding a stale
   // snapshot of the relay state and are rejected as expired.
-  const releaseLock = SingleInstanceLock.acquire();
+  const releaseLock = await acquireLock();
   if (!releaseLock) {
     process.stderr.write(`${LOG_PREFIX}: another watcher already holds ${SingleInstanceLock.path()}; exiting\n`);
     return;
   }
 
   const relay = new Relay();
-  const notifier = new Notifier({ relay });
+  const hcSource = new HcEventSource({ log: (line) => process.stderr.write(`${LOG_PREFIX}: ${line}\n`) });
+  const notifier = new Notifier({ relay, hcSource });
   let running = true;
   const stop = () => {
     running = false;
     releaseLock();
+    hcSource.stop();
     // Closed here rather than only after the loop: an open Slack Socket Mode
     // WebSocket keeps the event loop alive, so leaving it until the loop
     // unwinds delays shutdown by however long the in-flight polls take.
@@ -72,6 +95,7 @@ async function main() {
   // either call the process ignores SIGTERM entirely and lingers, accumulating
   // copies across herdr restarts that each double-handle every button click.
   SocketModeConnection.resetShared();
+  hcSource.stop();
   releaseLock();
 }
 

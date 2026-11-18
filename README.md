@@ -168,6 +168,7 @@ at `$HERDR_PLUGIN_CONFIG_DIR/config.json` (fallback: `~/.config/herdr-notificati
 | `relay.enabled` | `false` | Master switch for the interactive relay. Off by default. |
 | `relay.contextLines` | `40` | Lines of recent pane output to capture and show for a blocked agent (1–200). |
 | `relay.pollMs` | `1000` | How often to poll each provider for replies (minimum 500). Independent of `pollMs`. |
+| `hc.enabled` | `true` | Also watch herdr-app terminals through `hc events` (see [herdr-app agents](#herdr-app-agents-hc)). |
 | `providers.<id>.enabled` | `false` | Per-provider switch. Enable as many as you like. |
 | `providers.telegram.botToken` | `""` | Bot API token from BotFather. |
 | `providers.telegram.chatId` | `""` | Target chat id (string or number; groups are negative). |
@@ -257,6 +258,36 @@ That is enough for notifications and for typed answers. For **tappable buttons**
    UI, not through the API.
 
 Steps 5–7 are optional: leave `appToken` empty and Slack uses the reply-with-a-value list instead.
+
+## herdr-app agents (hc)
+
+The watcher also follows herdr-core with `hc events --json`, so agents in the herdr desktop app
+(status `working`/`blocked`/`done`/`idle` from OSC 7501) notify through the same config, filters,
+`minWorkingMs` and `delaySeconds`. Their pane id is `hc:<address>` (for example `hc:t7`). The
+interactive relay and auto-approve act on herdr TUI panes only, so a blocked hc agent gets a plain
+notification.
+
+**No double messages:** when a herdr TUI pane runs `hc attach <t>` and `<t>` reports a status, the
+pane's herdr event is dropped and only the hc event is sent.
+
+**When only herdr-app runs:** the `[[startup]]` hook needs the herdr TUI server, so install the
+watcher as a launchd agent. It uses the plugin's config dir and the same `watch.pid` lock, and runs
+with `--wait-lock`: if the TUI's own watcher holds the lock, it waits and takes over when that one
+stops. Exactly one watcher sends at a time.
+
+```bash
+bin/launchd.sh install     # ~/Library/LaunchAgents/com.barnuri.herdr-notifications.plist, KeepAlive
+bin/launchd.sh status      # launchd state and the tail of ~/Library/Logs/herdr-notifications.log
+bin/launchd.sh uninstall   # stop it and move the plist to the Trash
+```
+
+Run `bin/launchd.sh install` again after a code change to restart it.
+
+**Dry run** (reads real `hc events` and the real config, sends nothing):
+
+```bash
+HERDR_PLUGIN_CONFIG_DIR="$(herdr plugin config-dir barnuri.notifications)" node bin/hc-dry-run.js 30
+```
 
 ## Test it
 
